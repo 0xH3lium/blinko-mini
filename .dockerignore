@@ -1,0 +1,15 @@
+node_modules
+**/node_modules
+**/dist
+web/dist
+server/dist
+data
+.env
+.env.*
+!.env.example
+screenshots
+scripts/ui-check.cjs
+scripts/ui-flow.cjs
+*.log
+.git
+.gitignore

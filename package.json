@@ -1,0 +1,27 @@
+{
+  "name": "blinko-mini",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.28.5",
+  "description": "A single-user Telegram Mini App for capturing blinks and growing notes.",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n API,WEB -c cyan,magenta \"npm --workspace server run dev\" \"npm --workspace web run dev\"",
+    "build": "npm --workspace web run build && npm --workspace server run build",
+    "start": "node server/dist/index.js",
+    "test": "npm --workspace server run test",
+    "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "playwright-core": "^1.65.1",
+    "typescript": "^5.7.2"
+  }
+}

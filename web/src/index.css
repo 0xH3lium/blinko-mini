@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --fallback-bg: #f4efe5;
+  --fallback-surface: #fdfaf4;
+  --fallback-text: #221f19;
+  --fallback-hint: #857e70;
+  --fallback-accent: #d86038;
+  --fallback-accent-text: #fff8f2;
+
+  --app-bg: var(--tg-theme-bg-color, var(--fallback-bg));
+  --app-surface: var(--tg-theme-secondary-bg-color, var(--fallback-surface));
+  --app-text: var(--tg-theme-text-color, var(--fallback-text));
+  --app-hint: var(--tg-theme-hint-color, var(--fallback-hint));
+  --app-accent: var(--tg-theme-button-color, var(--fallback-accent));
+  --app-accent-text: var(--tg-theme-button-text-color, var(--fallback-accent-text));
+  --app-border: color-mix(in srgb, var(--app-text) 11%, transparent);
+  --app-accent-soft: color-mix(in srgb, var(--app-accent) 12%, transparent);
+
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html[data-theme='dark'] {
+  --fallback-bg: #14120f;
+  --fallback-surface: #1e1b17;
+  --fallback-text: #f1ebdf;
+  --fallback-hint: #9a9284;
+  --fallback-accent: #e97c52;
+  --fallback-accent-text: #1c120c;
+
+  --app-border: color-mix(in srgb, var(--app-text) 14%, transparent);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  background: var(--app-bg);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  overflow: hidden;
+  background:
+    radial-gradient(
+      ellipse 90% 50% at 96% -8%,
+      color-mix(in srgb, var(--app-accent) 7%, transparent),
+      transparent 65%
+    ),
+    var(--app-bg);
+  color: var(--app-text);
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  font-feature-settings: 'kern', 'liga';
+}
+
+#root {
+  min-height: 100dvh;
+  background: transparent;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  user-select: none;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--app-accent) 26%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--app-accent) 65%, transparent);
+  outline-offset: 2px;
+}
+
+textarea {
+  scrollbar-width: thin;
+}
+
+input[type='search']::-webkit-search-decoration,
+input[type='search']::-webkit-search-cancel-button,
+input[type='search']::-webkit-search-results-button,
+input[type='search']::-webkit-search-results-decoration {
+  -webkit-appearance: none;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.app-scroll {
+  scrollbar-width: none;
+  overscroll-behavior-y: contain;
+}
+
+.tag-scroller {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 0,
+    #000 calc(100% - 22px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    #000 0,
+    #000 calc(100% - 22px),
+    transparent 100%
+  );
+}
+
+.app-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.font-display {
+  font-family:
+    ui-serif,
+    'Iowan Old Style',
+    'Palatino Linotype',
+    Palatino,
+    'Book Antiqua',
+    Georgia,
+    serif;
+}
+
+.capture-card {
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.capture-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(
+      ellipse 70% 120% at 12% 0%,
+      color-mix(in srgb, var(--app-accent) 5%, transparent),
+      transparent 58%
+    );
+  pointer-events: none;
+}
+
+@keyframes loadingline {
+  0% {
+    transform: translateX(-110%);
+  }
+  60% {
+    transform: translateX(210%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

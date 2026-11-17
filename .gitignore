@@ -1,0 +1,15 @@
+node_modules/
+.pnpm-install-test/
+dist/
+web/dist/
+server/dist/
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+*.log
+.vite/
