@@ -278,14 +278,15 @@ export default function App() {
     if (result.capture) selectCapture(result.capture);
   }, [refresh, selectCapture]);
 
+  const captures = useMemo(() => page?.captures ?? [], [page]);
+  const allTags = useMemo(() => (telemetry?.tags ?? []).map((item) => item.name), [telemetry]);
+
   if (authed === null) {
     return <div className="flex h-full items-center justify-center text-[var(--muted)]"><LoaderCircle className="animate-spin" size={18} /></div>;
   }
   if (!authed) return <LoginGate onAuthed={() => setAuthed(true)} />;
 
-  const captures = useMemo(() => page?.captures ?? [], [page]);
   const reviewCount = review ? review.uncertain.length + review.unclassified.length : 0;
-  const allTags = useMemo(() => (telemetry?.tags ?? []).map((item) => item.name), [telemetry]);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
