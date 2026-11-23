@@ -1,176 +1,121 @@
-# Blinko-Mini
+# BLINKO//OS
 
-A quiet, single-user idea capture and note-taking app that lives inside Telegram.
+Single-user, text-only epistemic capture and decision-routing system. Telegram is the native input surface; `web/` is a desktop-first PC War Room. Every record is one atomic **capture** routed into six buckets: `idea`, `memory`, `reminder`, `question`, `reference`, `noise`.
 
-Capture a **Blink** from the bot chat or the Mini App's quick-capture dock, let it grow into a Markdown **Note**, and keep everything findable with `#tags` and SQLite full-text search. Warm paper, native Telegram theming, zero AI, zero media, zero ceremony.
+No images. No voice. No notes-vs-blinks split. No Mini App. No media storage. Hard 400 MB container RAM ceiling.
 
-![Blinko-Mini Blinks feed](screenshots/blinks-light.png)
+## Architecture
 
-## What it does
-
-- **Capture fast** — text sent to the bot or typed into the dock is saved as a Blink in one action.
-- **Grow ideas** — a full-screen editor with title, Markdown-friendly body, inline and manual tags, pin, archive, delete, and promote.
-- **Find things** — SQLite FTS5 search, tag filters, active/archived views, pinned-first ordering.
-- **Respect the context** — Telegram theme colors, safe areas, native `BackButton`, and haptic feedback.
-- **Stay private** — Telegram `initData` HMAC validation and a hard single-owner lock on both HTTP API and bot updates.
-
-Deliberately excluded: AI/LLM features, multi-user accounts, media uploads, public routes, streak/pet/pomodoro mechanics.
-
-## Stack
-
-| Layer | Choice |
-| --- | --- |
-| Runtime | Node.js 20+ / TypeScript |
-| HTTP | Hono + `@hono/node-server` |
-| Bot | grammY (long polling by default, webhook optional) |
-| Database | `better-sqlite3` + FTS5, WAL mode |
-| Frontend | React 18 + Vite + Tailwind CSS |
-| Telegram | `@twa-dev/sdk` |
-| Deploy | Docker multi-stage + compose, persistent `./data` |
-
-## Quick start (development)
-
-1. **Create a bot and get your owner ID**
-
-   Talk to [@BotFather](https://t.me/BotFather), create a bot, and copy its token. Get your numeric Telegram user ID from [@userinfobot](https://t.me/userinfobot).
-
-2. **Configure**
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   Fill in `BOT_TOKEN`, `OWNER_TELEGRAM_ID`, and — for local browser testing outside Telegram — uncomment `DEV_AUTH_BYPASS=true`. This bypass is ignored in production and production startup fails if it is enabled.
-
-3. **Install and run**
-
-   ```bash
-   pnpm install
-   pnpm dev
-   ```
-
-   Open **http://localhost:5173**. Vite proxies `/api` to the Hono server on port `3000`. The bot uses long polling, so it works locally without a public webhook.
-
-   `npm install && npm run dev` is equivalent if you prefer npm.
-
-4. **Open inside Telegram**
-
-   Telegram requires an HTTPS URL for Mini Apps. For local development, expose the Vite or production server with a tunnel (`cloudflared tunnel --url http://localhost:3000` or ngrok), then set the Mini App URL in BotFather.
-
-## Environment
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `BOT_TOKEN` | yes | Telegram bot token from BotFather. |
-| `OWNER_TELEGRAM_ID` | yes | The only Telegram user allowed to use the API and bot. |
-| `PORT` | no | HTTP port. Default `3000`. |
-| `NODE_ENV` | no | `development`, `test`, or `production`. |
-| `DB_PATH` | no | SQLite file path. Default `./data/app.db`. |
-| `BOT_MODE` | no | `polling` (default) or `webhook`. |
-| `WEBHOOK_URL` | webhook only | Public `https://` origin, e.g. `https://notes.example.com`. |
-| `WEBHOOK_PATH` | no | Default `/telegram/webhook`. |
-| `WEBHOOK_SECRET` | webhook only | Secret header token; `A-Z a-z 0-9 _ -` only. |
-| `DEV_AUTH_BYPASS` | no | Local browser convenience only. Never valid in production. |
-
-### Transport modes
-
-- **Polling (default):** on boot the server deletes any existing webhook, then starts long polling. Use this for local development.
-- **Webhook:** set `BOT_MODE=webhook`, a valid HTTPS `WEBHOOK_URL`, and `WEBHOOK_SECRET`. The server mounts the webhook route before the API and static site, and registers the webhook after HTTP starts. It never calls `bot.start()` in this mode.
-
-## Production
-
-```bash
-pnpm install
-pnpm build
-NODE_ENV=production pnpm start
+```text
+Telegram text / reactions / inline query
+        │
+        ▼
+Layer 0 deterministic  ── hashtags, chrono-node (Asia/Tehran), URL Readability (SSRF-guarded), SimHash, 12 lexical features
+        │
+Layer 1 local probes   ── concurrency-1 q8 ONNX MiniLM embeddings + online logistic / ridge probes + kNN cold start
+        │
+Layer 2 Jev            ── OpenRouter System One, batched heads, daily/monthly USD + call firewall
+        │
+        ▼
+SQLite (WAL) + RAM VectorIndex + SSE events → PC War Room
 ```
 
-`pnpm build` compiles the web SPA to `web/dist` and the server to `server/dist` (including `schema.sql`). `node server/dist/index.js` serves the API, the bot transport, and the SPA with a safe fallback for client-side routes.
+- **Emissions:** confident captures get one native emoji reaction. High-entropy routing gets inline bucket buttons. Collisions get paradox controls. Reminders get due-time cards.
+- **Physics:** `E(t) = E × exp(-λ × days)`; `λ` comes from the `half_life` head. Pinned, memory, and paradox-locked captures are immune. Hourly sublimation below `sublimate_energy`.
+- **Cost:** `gated` mode spends $0 until a probe is cold/uncertain or the `0.68..0.91` cosine collision band fires. `bootstrap` collects labels then auto-flips to gated. `off` is strict local-only.
+- **Auth:** `/web` in Telegram issues a 60-second single-use magic link and 8-character code. The panel gets an `HttpOnly`, `SameSite=Lax`, 30-day session cookie (`Secure` only when `PUBLIC_URL` is HTTPS).
 
-Put Caddy, Nginx, or Cloudflare in front of it so both the Mini App and webhook are HTTPS. Set the Mini App URL in BotFather to the public HTTPS origin.
+## Quick start
 
-### Docker
-
-```bash
+```sh
 cp .env.example .env
-# edit .env, ensure NODE_ENV is not overridden there
-mkdir -p data
+# fill BOT_TOKEN, OWNER_TELEGRAM_ID, OPENROUTER_API_KEY
+pnpm install
+pnpm dev            # server :3000 + Vite :5173
+```
+
+Production:
+
+```sh
+pnpm build
+pnpm start
+```
+
+Docker (400 MB limit, Node heap capped at 220 MB):
+
+```sh
 docker compose up -d --build
 ```
 
-The compose service mounts `./data` at `/app/data`, so `app.db`, WAL, and shared-memory files survive rebuilds. Set `BOT_MODE=webhook` with public HTTPS settings, or leave polling enabled. The container starts as root only long enough to fix the data-directory ownership, then drops to the unprivileged `node` user.
+Send `/web` to the bot, then open the link or paste the code into the login gate.
+
+## Environment
+
+See [`.env.example`](./.env.example). Important defaults:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PUBLIC_URL` | `http://localhost:3000` | Magic-link base and cookie `Secure` decision |
+| `OWNER_TIMEZONE` | `Asia/Tehran` | chrono-node + reminder formatting |
+| `EMBEDDING_MODEL` | `Xenova/all-MiniLM-L6-v2` | q8 384-d ONNX model cached in `./data/models` |
+| `JEV_MODEL` | `jev-1.13` | OpenRouter routes to `typesafe/jev-1.13` |
+| `JEV_DAILY_CALL_CAP` | `30` | hard call stop |
+| `JEV_DAILY_USD_CAP` | `0.25` | hard daily spend stop |
+| `JEV_MONTHLY_USD_CAP` | `3.00` | hard monthly spend stop |
+| `SESSION_SECRET` | auto in dev | required in production |
+| `DEV_AUTH_BYPASS` | off | rejected in production |
+
+## Bot protocol
+
+- Plain text → capture. Prefixes: `!rem`, `remind`, `mem:`, `idea:`.
+- `#hashtags` and URLs are extracted; URLs are fetched with a 5s timeout, 500 KB cap, and private-address rejection, then parsed with Readability.
+- Reactions: `📌` pin, `🔥` boost, `✅` resolve, `👎`/`💩` delete, `⚡` force Jev.
+- Commands: `/start`, `/help`, `/web`, `/remind`, `/collide`, `/budget`, `/jevmode`, `/heads`.
+- Inline recall: `@yourbot <query>` searches FTS5 + cosine and returns citable captures.
+- Edits sync content, embedding, and the parsed reminder.
+
+## PC War Room
+
+- `[1] Stream` — dense keyboard-driven table (`j/k`, `space`, `p`, `r`, `x`, `e`).
+- `[2] Topology` — Canvas2D `d3-force` graph, energy radius, pulsing paradox edges, heatmap by bucket or any head, decay simulation.
+- `[3] Triage` — uncertain / paradox / zombie / expiring arena; `1–6` reclassifies and trains the bucket probe.
+- `[4] Jev Lab` — mode, thresholds, head CRUD, cost-previewed targeted sweeps, local-vs-Jev playground, RAM/cost/distillation telemetry.
+- `⌘K` / `/` — hybrid search + actions. Right Inspector has markdown rendering, decision probability bars, one-click human overrides (weight 2.5), edges, reminder and raw physics.
 
 ## API
 
-All item/tag routes require a valid Telegram WebApp `initData` header:
-
-```http
-X-Telegram-Init-Data: <raw initData>
-```
-
-`Authorization: tma <raw initData>` is also accepted. Invalid data → `401`; valid data from a different Telegram user → `403`.
-
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/health` | Public `{ ok, botMode }`. |
-| `GET` | `/api/items` | List/filter/search items. |
-| `GET` | `/api/items/:id` | Single item. |
-| `POST` | `/api/items` | Create a Blink or Note. |
-| `PATCH` | `/api/items/:id` | Update fields; also promotes Blinks to Notes. |
-| `DELETE` | `/api/items/:id` | Hard delete, cascade tags, sync FTS. |
-| `GET` | `/api/tags` | Tags with item counts. |
-
-`GET /api/items` query parameters: `type=blink|note`, `status=active|archived` (default `active`), `tag`, `q`, `limit` (default 50, max 200), `offset`.
-
-Search input is converted to quoted FTS5 prefix terms (`read book` → `"read"* "book"*`), so punctuation and operators cannot break the query.
-
-## Bot behavior
-
-- The owner guard is registered as the very first middleware; every update from another user is dropped silently.
-- `/start` confirms the app is ready.
-- Any other text message becomes a Blink, gets a 👍 reaction when Telegram allows it, and receives a short `Saved Blink #…` reply.
-- Commands are never captured as blinks.
-
-## Project layout
+All `/api/*` routes except `/api/health` require the session cookie (or non-production `DEV_AUTH_BYPASS`).
 
 ```text
-.
-├── server/src
-│   ├── config.ts            # env validation
-│   ├── app.ts               # route order: webhook → API → static → SPA fallback
-│   ├── index.ts             # startup + graceful shutdown
-│   ├── db/                  # schema.sql, client, typed queries
-│   ├── services/            # shared item/tag business logic
-│   ├── middleware/tgAuth.ts # HMAC-SHA256 initData + owner check
-│   ├── routes/api.ts
-│   └── bot/                 # owner guard, handlers, transport switch
-├── server/test              # FTS sync, service CRUD, auth, API flow
-├── web/src
-│   ├── pages/               # Blinks, Notes, Editor
-│   ├── components/          # cards, search, tags, nav, dialogs, toast
-│   ├── hooks/
-│   └── api/client.ts
-├── Dockerfile
-└── docker-compose.yml
+GET    /api/health
+GET    /api/events                 SSE: capture.created/updated/deleted, edge.created, reminder.updated, telemetry.updated, sweep.progress
+GET    /api/captures               bucket, status, tag, q, paradoxOnly, minResonance, minEnergy/maxEnergy, headFilters, sort, limit, offset
+POST   /api/captures               same pipeline as Telegram
+GET    /api/captures/:id           detail + decisions + edges + reminder + effective energy
+PATCH  /api/captures/:id           content, bucket, status, pin, tags, reminderDueAt
+DELETE /api/captures/:id
+POST   /api/captures/:id/override  human decision, trains Layer-1
+POST   /api/captures/:id/jev       force fresh Jev pass
+GET    /api/triage
+GET    /api/graph
+GET    /api/heads                  POST /api/heads, PATCH/DELETE /api/heads/:id
+POST   /api/heads/:id/sweep/preview|run
+POST   /api/heads/test
+GET    /api/telemetry
+PATCH  /api/settings
 ```
 
 ## Verification
 
-```bash
-pnpm test
+```sh
 pnpm typecheck
+pnpm test
 pnpm build
+pnpm ram-check     # real q8 ONNX, 30 sentences, SQLite, prints RSS
 ```
 
-The backend suite covers FTS trigger synchronization across insert/update/delete, tag extraction and orphan cleanup, CRUD/promote/pin/archive behavior, HMAC signatures, owner enforcement, pagination, and the full API capture-to-note flow.
+The RAM check passes at roughly **130–150 MB RSS**, leaving headroom under the 400 MB container ceiling and the 320 MB verification gate.
 
-Manual production smoke checks worth repeating after changes:
+## Schema highlights
 
-1. `GET /api/items` without initData → `401`.
-2. Valid owner initData → `200`; another signed user → `403`.
-3. `/api/health` remains public and reports the active bot mode.
-4. In webhook mode, requests without the secret header are rejected before the bot handles an update.
-
-## Data and privacy
-
-The app stores only text, tags, timestamps, status, and a JSON `meta` column (default `{}`) in one local SQLite file. No analytics, external AI calls, or media storage. Back up `data/` to keep your notes.
+`captures`, `captures_fts` (FTS5 + sync triggers), `tags`/`capture_tags`, `telegram_messages`, `capture_edges`, `reminders`, `decision_heads`, `capture_decisions`, `jev_usage`, `app_settings`, `auth_tokens`. Four system heads are seeded idempotently: `bucket` (choice), `leverage` (score 0–3), `half_life` (score 0–3), `falsifiable` (noul).

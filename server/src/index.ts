@@ -2,46 +2,40 @@ import { serve } from '@hono/node-server';
 import { config } from './config.js';
 import { createApp } from './app.js';
 import { closeDatabase, getDatabase } from './db/client.js';
-import { createBot } from './bot/bot.js';
+import { createBot, sendSchedulerReminder } from './bot/bot.js';
 import { startBotTransport, stopBotTransport } from './bot/transport.js';
+import { startScheduler, stopScheduler } from './engine/scheduler.js';
+import { hydrateVectorIndex } from './engine/embeddings.js';
+import { initCapturesService } from './services/captures.service.js';
 
 async function main(): Promise<void> {
-  // Initialize (and migrate) the database before accepting traffic.
-  getDatabase();
+  const db = getDatabase();
+  initCapturesService(db);
+  hydrateVectorIndex(db);
 
   const bot = createBot();
   const app = createApp(bot);
   let shuttingDown = false;
 
-  const server = serve(
-    {
-      fetch: app.fetch,
-      port: config.PORT,
-    },
-    (info) => {
-      console.log(`[Server] Blinko-Mini listening on http://localhost:${info.port}`);
-      console.log(`[Server] Bot mode: ${config.BOT_MODE}`);
-    },
-  );
+  const server = serve({ fetch: app.fetch, port: config.PORT }, (info) => {
+    console.log(`[Server] BLINKO//OS listening on http://localhost:${info.port}`);
+    console.log(`[Server] Bot mode: ${config.BOT_MODE} · TZ: ${config.OWNER_TIMEZONE}`);
+  });
+
+  startScheduler(db, { notifyReminder: sendSchedulerReminder });
 
   try {
     await startBotTransport(bot);
   } catch (error) {
-    // The API remains useful for the Mini App; surface a precise bot error
-    // without taking the whole service down (e.g. a bad/rotated token).
     console.error('[Bot] Failed to initialize transport:', error);
   }
 
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`\n[Server] Received ${signal}, shutting down...`);
-
-    const forceExit = setTimeout(() => {
-      console.error('[Server] Graceful shutdown timed out.');
-      process.exit(1);
-    }, 8_000);
-
+    console.log(`\n[Server] ${signal}, shutting down...`);
+    const forceExit = setTimeout(() => process.exit(1), 8_000);
+    stopScheduler();
     await stopBotTransport(bot);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     closeDatabase();

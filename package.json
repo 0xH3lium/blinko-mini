@@ -1,10 +1,10 @@
 {
-  "name": "blinko-mini",
+  "name": "blinko-os",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.28.5",
-  "description": "A single-user Telegram Mini App for capturing blinks and growing notes.",
+  "description": "Blinko-OS: single-user text-only epistemic capture, Jev distillation, and PC war room.",
   "workspaces": [
     "server",
     "web"
@@ -14,7 +14,8 @@
     "build": "npm --workspace web run build && npm --workspace server run build",
     "start": "node server/dist/index.js",
     "test": "npm --workspace server run test",
-    "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck"
+    "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck",
+    "ram-check": "node server/scripts/ram-check.mjs"
   },
   "engines": {
     "node": ">=20"

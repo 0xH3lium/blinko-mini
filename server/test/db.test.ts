@@ -1,191 +1,88 @@
 import assert from 'node:assert/strict';
-import { afterEach, test } from 'node:test';
-import type Database from 'better-sqlite3';
+import { test } from 'node:test';
 import { createDatabase } from '../src/db/client.js';
-import { ItemsService, extractHashtags, normalizeTags } from '../src/services/items.service.js';
-import { buildFtsQuery, listItems } from '../src/db/queries.js';
+import {
+  captureFromRow,
+  getCapture,
+  getHeadRow,
+  listHeads,
+  listCaptures,
+  setCaptureTags,
+  type CaptureRow,
+} from '../src/db/queries.js';
 
-let db: Database.Database | undefined;
-
-afterEach(() => {
-  db?.close();
-  db = undefined;
+test('schema seeds four system heads and five default settings', () => {
+  const db = createDatabase(':memory:');
+  const heads = listHeads(db);
+  assert.deepEqual(heads.map((head) => head.name), ['bucket', 'leverage', 'half_life', 'falsifiable']);
+  assert.equal(heads.filter((head) => head.isSystem).length, 4);
+  const settings = db.prepare('SELECT key FROM app_settings ORDER BY key').all() as Array<{ key: string }>;
+  assert.deepEqual(settings.map((row) => row.key), [
+    'bootstrap_target',
+    'collision_min_cos',
+    'jev_mode',
+    'resonance_min_cos',
+    'sublimate_energy',
+  ]);
+  db.close();
 });
 
-function freshService(): ItemsService {
-  db = createDatabase(':memory:');
-  return new ItemsService(db);
-}
-
-test('FTS5 index follows inserts, updates, and deletes via triggers', () => {
-  db = createDatabase(':memory:');
+test('FTS5 triggers stay in sync with capture inserts, updates, deletes', () => {
+  const db = createDatabase(':memory:');
   const now = Date.now();
   db.prepare(
-    `INSERT INTO items (id, type, title, content, created_at, updated_at)
-     VALUES ('fts-1', 'blink', NULL, 'alpha bravo', ?, ?)`,
-  ).run(now, now);
-
+    `INSERT INTO captures (id, content, last_activated_at, created_at, updated_at)
+     VALUES ('c1', 'alpha bravo', ?, ?, ?)`,
+  ).run(now, now, now);
   const search = (query: string) =>
-    db!
-      .prepare('SELECT rowid FROM items_fts WHERE items_fts MATCH ?')
-      .all(query) as Array<{ rowid: number }>;
-
+    db.prepare('SELECT rowid FROM captures_fts WHERE captures_fts MATCH ?').all(query) as Array<{ rowid: number }>;
   assert.equal(search('"alpha"*').length, 1);
-
-  db.prepare(
-    `UPDATE items SET title = 'Charlie', content = 'delta echo', updated_at = ? WHERE id = 'fts-1'`,
-  ).run(now + 1);
-
+  db.prepare('UPDATE captures SET content = ? WHERE id = ?').run('delta echo', 'c1');
   assert.equal(search('"alpha"*').length, 0);
   assert.equal(search('"delta"*').length, 1);
-  assert.equal(search('"charlie"*').length, 1);
-
-  db.prepare(`DELETE FROM items WHERE id = 'fts-1'`).run();
+  db.prepare('DELETE FROM captures WHERE id = ?').run('c1');
   assert.equal(search('"delta"*').length, 0);
+  db.close();
 });
 
-test('hashtag extraction is lowercased, deduplicated, and safe', () => {
-  assert.deepEqual(
-    extractHashtags('Try #JEV and #decision-model, then #jev again. #idea_2 #x'),
-    ['jev', 'decision-model', 'idea_2', 'x'],
+test('captures, tags, bucket counts and filters work', () => {
+  const db = createDatabase(':memory:');
+  const now = Date.now();
+  const insert = db.prepare(
+    `INSERT INTO captures (id, content, bucket, energy, resonance_count, last_activated_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  assert.deepEqual(extractHashtags('email#notatag and #bad!'), ['bad']);
-  assert.deepEqual(
-    normalizeTags([' #Alpha ', 'beta', 'bad tag', '#alpha', 'UPPER-CASE']),
-    ['alpha', 'beta', 'upper-case'],
-  );
+  insert.run('a', 'one #shared', 'idea', 1.2, 3, now, now, now);
+  insert.run('b', 'two #other', 'memory', 0.2, 1, now, now, now);
+  setCaptureTags(db, 'a', ['shared', 'alpha']);
+  setCaptureTags(db, 'b', ['other']);
+
+  const page = listCaptures(db, { status: 'active', tag: 'shared' });
+  assert.equal(page.captures.length, 1);
+  assert.deepEqual(page.captures[0]?.tags, ['alpha', 'shared']);
+  assert.equal(page.bucketCounts.idea, 1);
+
+  const resonant = listCaptures(db, { status: 'active', minResonance: 2 });
+  assert.equal(resonant.captures[0]?.id, 'a');
+
+  const q = listCaptures(db, { status: 'active', q: 'two', semantic: [{ id: 'a', score: 0.4 }, { id: 'b', score: 0.9 }] });
+  assert.ok(q.captures.some((capture) => capture.id === 'b'));
+  db.close();
 });
 
-test('FTS query builder neutralizes syntax characters', () => {
-  assert.equal(buildFtsQuery('read book'), '"read"* "book"*');
-  assert.equal(buildFtsQuery('foo-bar'), '"foo-bar"*');
-  assert.equal(buildFtsQuery('"quoted"'), '"""quoted"""*');
-  assert.equal(buildFtsQuery('#tag - : *'), '"#tag"*');
-  assert.equal(buildFtsQuery('   '), null);
-});
-
-test('items can be created, searched, filtered, promoted, pinned, and archived', () => {
-  const service = freshService();
-  const blink = service.create({
-    type: 'blink',
-    content: 'Think about #JEV model for  priority',
-    tags: ['extra-tag', 'JEV'],
-  });
-
-  assert.equal(blink.type, 'blink');
-  assert.deepEqual(blink.tags, ['extra-tag', 'jev']);
-  assert.equal(blink.status, 'active');
-  assert.equal(blink.isPinned, false);
-
-  const page = service.list({ type: 'blink', q: 'think' });
-  assert.equal(page.total, 1);
-  assert.equal(page.items[0]?.id, blink.id);
-
-  assert.equal(service.list({ q: 'priority' }).total, 1);
-  assert.equal(service.list({ q: 'foo-bar:*' }).total, 0);
-  assert.equal(service.list({ q: '***' }).total, 0);
-  assert.equal(service.list({ tag: 'jev' }).total, 1);
-  assert.equal(service.list({ tag: 'extra-tag' }).total, 1);
-  assert.equal(service.list({ tag: 'missing' }).total, 0);
-
-  const promoted = service.update(blink.id, {
-    type: 'note',
-    title: '',
-    isPinned: true,
-  });
-  assert.ok(promoted);
-  assert.equal(promoted.type, 'note');
-  assert.equal(promoted.title, 'Think about #JEV model for  priority');
-  assert.equal(promoted.isPinned, true);
-  assert.ok(promoted.updatedAt > blink.updatedAt);
-
-  const archived = service.update(blink.id, { status: 'archived' });
-  assert.equal(archived?.status, 'archived');
-  assert.equal(service.list({ type: 'note' }).total, 0);
-  assert.equal(service.list({ type: 'note', status: 'archived' }).total, 1);
-
-  const restored = service.update(blink.id, { status: 'active' });
-  assert.equal(restored?.status, 'active');
-});
-
-test('editing tags preserves manual tags unless an explicit list is passed', () => {
-  const service = freshService();
-  const item = service.create({
-    content: 'alpha #inline',
-    tags: ['manual'],
-  });
-
-  const contentOnly = service.update(item.id, {
-    content: 'beta #next',
-  });
-  assert.deepEqual(contentOnly?.tags, ['inline', 'manual', 'next']);
-
-  const explicit = service.update(item.id, {
-    content: contentOnly!.content,
-    tags: ['only-this'],
-  });
-  assert.deepEqual(explicit?.tags, ['next', 'only-this']);
-
-  const tagNames = service.tags().map((tag) => tag.name);
-  assert.ok(!tagNames.includes('manual'));
-  assert.ok(!tagNames.includes('inline'));
-});
-
-test('archive, pin, and delete return correct counts and clean orphan tags', () => {
-  const service = freshService();
-  const a = service.create({ content: 'one #shared #alpha' });
-  const b = service.create({ content: 'two #shared #beta' });
-
-  assert.deepEqual(
-    service.tags().map((tag) => [tag.name, tag.count]),
-    [
-      ['shared', 2],
-      ['alpha', 1],
-      ['beta', 1],
-    ],
-  );
-
-  assert.equal(service.remove(a.id), true);
-  assert.equal(service.remove(a.id), false);
-  assert.deepEqual(
-    service.tags().map((tag) => [tag.name, tag.count]),
-    [
-      ['beta', 1],
-      ['shared', 1],
-    ],
-  );
-
-  service.remove(b.id);
-  assert.deepEqual(service.tags(), []);
-});
-
-test('note titles fall back to the first line or Untitled', () => {
-  const service = freshService();
-  const withLine = service.create({
-    type: 'note',
-    content: '\n  First line title\nBody',
-  });
-  assert.equal(withLine.title, 'First line title');
-
-  const blank = service.create({ type: 'note', content: '!!!' });
-  assert.equal(blank.title, '!!!');
-
-  assert.throws(() => service.create({ content: '   ' }), /non-empty/);
-});
-
-test('list ordering pins items and paginates with total', () => {
-  const service = freshService();
-  const older = service.create({ content: 'older' });
-  const newer = service.create({ content: 'newer' });
-  service.update(older.id, { isPinned: true });
-
-  const page = service.list({ limit: 1, offset: 0 });
-  assert.equal(page.total, 2);
-  assert.equal(page.items.length, 1);
-  assert.equal(page.items[0]?.id, older.id);
-
-  const second = service.list({ limit: 1, offset: 1 });
-  assert.equal(second.items[0]?.id, newer.id);
-  const all = listItems(db!, { status: 'active', limit: 50 });
-  assert.equal(all.total, 2);
+test('head rows round-trip primitives and config', () => {
+  const db = createDatabase(':memory:');
+  const bucket = getHeadRow(db, 'head-bucket');
+  assert.ok(bucket);
+  assert.equal(bucket!.primitive, 'choice');
+  assert.ok(bucket!.config_json.includes('options'));
+  const row = db.prepare('SELECT * FROM captures LIMIT 1').get() as CaptureRow | undefined;
+  assert.equal(row, undefined);
+  assert.equal(captureFromRow({
+    id: 'x', content: 'y', bucket: 'idea', status: 'active', is_pinned: 0, energy: 1,
+    decay_lambda: 0.05, resonance_count: 1, last_activated_at: 1, simhash: null,
+    embedding: null, meta: '{}', created_at: 1, updated_at: 1,
+  }).bucket, 'idea');
+  assert.equal(getCapture(db, 'missing'), undefined);
+  db.close();
 });

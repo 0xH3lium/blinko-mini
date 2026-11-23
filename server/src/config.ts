@@ -1,27 +1,47 @@
+import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
-/** The repository root, independent of the directory npm invokes us from. */
 export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 dotenv.config({ path: resolve(PROJECT_ROOT, '.env') });
+
+const bool = z
+  .string()
+  .optional()
+  .transform((value) => value?.toLowerCase() === 'true');
 
 const envSchema = z
   .object({
     PORT: z.coerce.number().int().positive().max(65_535).default(3000),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     DB_PATH: z.string().min(1).default('./data/app.db'),
+    PUBLIC_URL: z.string().default('http://localhost:3000'),
+    OWNER_TIMEZONE: z.string().default('Asia/Tehran'),
+
     BOT_TOKEN: z.string().min(1, 'BOT_TOKEN is required'),
-    OWNER_TELEGRAM_ID: z.coerce
-      .number({ invalid_type_error: 'OWNER_TELEGRAM_ID must be a numeric Telegram user id' })
-      .int()
-      .positive(),
+    OWNER_TELEGRAM_ID: z.coerce.number().int().positive(),
     BOT_MODE: z.enum(['polling', 'webhook']).default('polling'),
-    WEBHOOK_URL: z.string().url().optional(),
+    WEBHOOK_URL: z.preprocess((value) => (value === '' ? undefined : value), z.string().url().optional()),
     WEBHOOK_PATH: z.string().default('/telegram/webhook'),
-    WEBHOOK_SECRET: z.string().optional(),
+    WEBHOOK_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
+
+    OPENROUTER_API_KEY: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
+    JEV_MODEL: z.string().default('jev-1.13'),
+    JEV_DAILY_CALL_CAP: z.coerce.number().int().nonnegative().default(30),
+    JEV_DAILY_USD_CAP: z.coerce.number().nonnegative().default(0.25),
+    JEV_MONTHLY_USD_CAP: z.coerce.number().nonnegative().default(3),
+
+    EMBEDDING_MODEL: z.string().default('Xenova/all-MiniLM-L6-v2'),
+    EMBEDDING_ENABLED: z
+      .string()
+      .optional()
+      .default('true')
+      .transform((value) => value.toLowerCase() !== 'false'),
+
+    SESSION_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
     DEV_AUTH_BYPASS: z
       .string()
       .optional()
@@ -29,60 +49,21 @@ const envSchema = z
   })
   .superRefine((env, ctx) => {
     if (!env.WEBHOOK_PATH.startsWith('/')) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['WEBHOOK_PATH'],
-        message: 'WEBHOOK_PATH must start with "/"',
-      });
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['WEBHOOK_PATH'], message: 'must start with "/"' });
     }
-
-    if (env.BOT_MODE !== 'webhook') return;
-
-    if (!env.WEBHOOK_URL) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['WEBHOOK_URL'],
-        message: 'WEBHOOK_URL is required when BOT_MODE=webhook',
-      });
-    } else {
-      try {
-        const url = new URL(env.WEBHOOK_URL);
-        if (url.protocol !== 'https:') {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['WEBHOOK_URL'],
-            message: 'WEBHOOK_URL must use https://',
-          });
-        }
-      } catch {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['WEBHOOK_URL'],
-          message: 'WEBHOOK_URL must be a valid URL',
-        });
+    if (env.BOT_MODE === 'webhook') {
+      if (!env.WEBHOOK_URL) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['WEBHOOK_URL'], message: 'required in webhook mode' });
+      }
+      if (!env.WEBHOOK_SECRET) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['WEBHOOK_SECRET'], message: 'required in webhook mode' });
       }
     }
-
-    if (!env.WEBHOOK_SECRET) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['WEBHOOK_SECRET'],
-        message: 'WEBHOOK_SECRET is required when BOT_MODE=webhook',
-      });
-    } else if (!/^[A-Za-z0-9_-]{1,256}$/.test(env.WEBHOOK_SECRET)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['WEBHOOK_SECRET'],
-        message: 'WEBHOOK_SECRET may only contain A-Z, a-z, 0-9, "_" and "-"',
-      });
+    if (env.NODE_ENV === 'production' && !env.SESSION_SECRET) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SESSION_SECRET'], message: 'required in production' });
     }
-
     if (env.DEV_AUTH_BYPASS && env.NODE_ENV === 'production') {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['DEV_AUTH_BYPASS'],
-        message: 'DEV_AUTH_BYPASS must never be enabled in production',
-      });
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['DEV_AUTH_BYPASS'], message: 'must never be enabled in production' });
     }
   });
 
@@ -92,19 +73,20 @@ if (!parsed.success) {
   const details = parsed.error.issues
     .map((issue) => `  - ${issue.path.join('.') || 'env'}: ${issue.message}`)
     .join('\n');
-  console.error(`[Config] Invalid environment configuration:\n${details}\n\nCopy .env.example to .env and fill in the required values.`);
+  console.error(`[Config] Invalid environment:\n${details}\n\nCopy .env.example to .env and fill it in.`);
   process.exit(1);
 }
 
+const data = parsed.data;
+
 export const config = {
-  ...parsed.data,
+  ...data,
   PROJECT_ROOT,
-  DB_PATH:
-    parsed.data.DB_PATH === ':memory:'
-      ? parsed.data.DB_PATH
-      : resolve(PROJECT_ROOT, parsed.data.DB_PATH),
-  DEV_AUTH_BYPASS:
-    parsed.data.NODE_ENV !== 'production' && parsed.data.DEV_AUTH_BYPASS === true,
+  DB_PATH: data.DB_PATH === ':memory:' ? data.DB_PATH : resolve(PROJECT_ROOT, data.DB_PATH),
+  SESSION_SECRET: data.SESSION_SECRET ?? randomBytes(32).toString('hex'),
+  DEV_AUTH_BYPASS: data.NODE_ENV !== 'production' && data.DEV_AUTH_BYPASS === true,
+  MODELS_DIR: resolve(PROJECT_ROOT, 'data/models'),
+  SECURE_COOKIE: data.PUBLIC_URL.startsWith('https://'),
 };
 
 export type Config = typeof config;

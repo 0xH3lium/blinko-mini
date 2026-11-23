@@ -30,16 +30,18 @@ export function Toast({ message, tone, onDismiss }: ToastProps) {
       aria-live="polite"
       className={cn(
         'fixed left-1/2 top-[max(12px,env(safe-area-inset-top))] z-[100] flex w-[calc(100%-24px)] max-w-[420px]',
-        '-translate-x-1/2 animate-toast-in items-center gap-2.5 rounded-2xl border px-3.5 py-2.5 shadow-float backdrop-blur-xl',
-        'border-[var(--app-border)] bg-[color-mix(in_srgb,var(--app-surface)_92%,transparent)] text-[var(--app-text)]',
+        '-translate-x-1/2 animate-toast-in items-center gap-2.5 rounded-xl border px-3.5 py-2.5 shadow-float backdrop-blur-xl',
+        'border-[var(--app-border)] bg-[var(--app-surface)] text-[var(--app-text)]',
+        tone === 'success' && 'border-[var(--app-accent-border)]',
+        tone === 'error' && 'border-[var(--app-danger-soft)]',
       )}
     >
       <Icon
         size={17}
         className={cn(
           'shrink-0',
-          tone === 'success' && 'text-[#4d8963]',
-          tone === 'error' && 'text-[#c6493e]',
+          tone === 'success' && 'text-[var(--app-accent-bright)]',
+          tone === 'error' && 'text-[var(--app-danger)]',
           tone === 'info' && 'text-[var(--app-accent)]',
         )}
       />
@@ -48,7 +50,7 @@ export function Toast({ message, tone, onDismiss }: ToastProps) {
         type="button"
         onClick={onDismiss}
         aria-label="Dismiss notification"
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition hover:bg-[var(--app-accent-soft)]"
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-muted)] transition hover:bg-[var(--app-surface-hover)] hover:text-[var(--app-text)]"
       >
         <X size={13} />
       </button>
