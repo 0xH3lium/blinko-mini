@@ -91,6 +91,7 @@ export function createBot(): Bot {
     const login = createLoginToken(db());
     await ctx.reply(
       `🖥️ PC War Room (valid 60s):\n${login.url}\n\nOr localhost copy-paste code:\n${login.code}`,
+      { link_preview_options: { is_disabled: true } },
     );
   });
 
