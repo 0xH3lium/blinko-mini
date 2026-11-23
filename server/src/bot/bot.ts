@@ -21,12 +21,12 @@ import { computeEffectiveEnergy } from '../engine/physics.js';
 import type { Reminder } from '../db/queries.js';
 
 const BUCKET_EMOJI: Record<Bucket, string> = {
-  idea: '💡',
-  memory: '🧠',
-  reminder: '⏰',
-  question: '❓',
-  reference: '🔗',
-  noise: '🫧',
+  idea: '🤯',
+  memory: '🤔',
+  reminder: '🙏',
+  question: '👀',
+  reference: '👌',
+  noise: '😎',
 };
 
 function fmtTime(ts: number): string {
@@ -209,7 +209,7 @@ export function createBot(): Bot {
     }
 
     if (result.reminderDueAt) {
-      void ctx.react('⏰' as never).catch(() => undefined);
+      void ctx.react('🙏' as never).catch(() => undefined);
       const keyboard = new InlineKeyboard()
         .text('Done ✓', `rem:${capture.id}:done`)
         .text('Cancel', `rem:${capture.id}:kill`);
