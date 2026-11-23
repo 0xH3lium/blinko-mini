@@ -90,7 +90,7 @@ apiRoutes.get('/events', (c) =>
 apiRoutes.get('/captures', async (c) => {
   const query = c.req.query();
   const filters: CaptureFilters = {
-    status: statusEnum.safeParse(query.status).success ? (query.status as 'active') : 'active',
+    status: query.status === 'all' ? undefined : (statusEnum.safeParse(query.status).success ? (query.status as 'active') : 'active'),
     limit: query.limit ? Number(query.limit) : 100,
     offset: query.offset ? Number(query.offset) : 0,
   };

@@ -46,7 +46,7 @@ export function CommandPalette({
     let cancelled = false;
     setBusy(true);
     const timer = window.setTimeout(() => {
-      getCaptures({ q: query, limit: 8 })
+      getCaptures({ q: query, limit: 8, status: 'all' })
         .then((page) => { if (!cancelled) setResults(page.captures); })
         .catch(() => { if (!cancelled) setResults([]); })
         .finally(() => { if (!cancelled) setBusy(false); });
