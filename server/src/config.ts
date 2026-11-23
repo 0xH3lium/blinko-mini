@@ -8,11 +8,6 @@ export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..
 
 dotenv.config({ path: resolve(PROJECT_ROOT, '.env') });
 
-const bool = z
-  .string()
-  .optional()
-  .transform((value) => value?.toLowerCase() === 'true');
-
 const envSchema = z
   .object({
     PORT: z.coerce.number().int().positive().max(65_535).default(3000),
@@ -29,17 +24,11 @@ const envSchema = z
     WEBHOOK_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
 
     OPENROUTER_API_KEY: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
-    JEV_MODEL: z.string().default('jev-1.13'),
+    JEV_MODEL: z.string().default('typesafe/jev-1.14'),
     JEV_DAILY_CALL_CAP: z.coerce.number().int().nonnegative().default(30),
     JEV_DAILY_USD_CAP: z.coerce.number().nonnegative().default(0.25),
     JEV_MONTHLY_USD_CAP: z.coerce.number().nonnegative().default(3),
 
-    EMBEDDING_MODEL: z.string().default('Xenova/all-MiniLM-L6-v2'),
-    EMBEDDING_ENABLED: z
-      .string()
-      .optional()
-      .default('true')
-      .transform((value) => value.toLowerCase() !== 'false'),
 
     SESSION_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
     DEV_AUTH_BYPASS: z
@@ -85,7 +74,6 @@ export const config = {
   DB_PATH: data.DB_PATH === ':memory:' ? data.DB_PATH : resolve(PROJECT_ROOT, data.DB_PATH),
   SESSION_SECRET: data.SESSION_SECRET ?? randomBytes(32).toString('hex'),
   DEV_AUTH_BYPASS: data.NODE_ENV !== 'production' && data.DEV_AUTH_BYPASS === true,
-  MODELS_DIR: resolve(PROJECT_ROOT, 'data/models'),
   SECURE_COOKIE: data.PUBLIC_URL.startsWith('https://'),
 };
 

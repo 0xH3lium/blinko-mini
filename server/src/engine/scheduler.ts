@@ -1,52 +1,43 @@
 import type Database from 'better-sqlite3';
-import { getCapture, getSetting, listDueReminders, type Reminder } from '../db/queries.js';
-import { sublimationSweep } from './physics.js';
+import type { Bot } from 'grammy';
+import { getCapture, listDueReminders } from '../db/queries.js';
+import { sendSchedulerReminder } from '../bot/bot.js';
 import { emit } from '../services/events.service.js';
 
-export interface SchedulerHooks {
-  notifyReminder: (captureId: string, content: string, reminder: Reminder) => Promise<void>;
-}
-
 let timer: NodeJS.Timeout | null = null;
-let lastSweep = 0;
+let busy = false;
 
-async function tick(db: Database.Database, hooks: SchedulerHooks): Promise<void> {
-  const now = Date.now();
-  const due = listDueReminders(db, now);
-  for (const reminder of due) {
-    const capture = getCapture(db, reminder.captureId);
-    if (!capture) continue;
-    try {
-      await hooks.notifyReminder(capture.id, capture.content, reminder);
-      db.prepare(`UPDATE reminders SET state = 'notified', last_notified_at = ? WHERE capture_id = ?`).run(
-        now,
-        reminder.captureId,
-      );
-      emit('reminder.updated', { captureId: reminder.captureId, state: 'notified' });
-    } catch (error) {
-      console.error('[Scheduler] reminder notify failed:', error);
+async function tick(db: Database.Database, bot: Bot): Promise<void> {
+  if (busy) return;
+  busy = true;
+  try {
+    const now = Date.now();
+    for (const reminder of listDueReminders(db, now)) {
+      const capture = getCapture(db, reminder.captureId);
+      if (!capture) continue;
+      try {
+        await sendSchedulerReminder(bot, capture.id, capture.content, reminder);
+        db.prepare(`UPDATE reminders SET state = 'notified', last_notified_at = ? WHERE capture_id = ?`).run(
+          Date.now(),
+          reminder.captureId,
+        );
+        emit('reminder.updated', { captureId: reminder.captureId, state: 'notified' });
+      } catch (error) {
+        console.error('[Scheduler] reminder notify failed:', error);
+      }
     }
-  }
-
-  if (now - lastSweep >= 3_600_000) {
-    lastSweep = now;
-    const threshold = Number(getSetting(db, 'sublimate_energy', '0.15'));
-    const count = sublimationSweep(db, threshold, now);
-    if (count > 0) {
-      emit('telemetry.updated', { sublimated: count });
-      console.log(`[Scheduler] sublimated ${count} low-energy captures`);
-    }
+  } finally {
+    busy = false;
   }
 }
 
-export function startScheduler(db: Database.Database, hooks: SchedulerHooks): void {
+export function startScheduler(db: Database.Database, bot: Bot): void {
   if (timer) return;
-  lastSweep = Date.now() - 3_600_000;
   timer = setInterval(() => {
-    void tick(db, hooks).catch((error: unknown) => console.error('[Scheduler] tick failed:', error));
+    void tick(db, bot).catch((error: unknown) => console.error('[Scheduler] tick failed:', error));
   }, 60_000);
   timer.unref?.();
-  void tick(db, hooks).catch(() => undefined);
+  void tick(db, bot).catch(() => undefined);
 }
 
 export function stopScheduler(): void {

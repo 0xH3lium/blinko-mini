@@ -2,30 +2,33 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 process.env.NODE_ENV = 'test';
-process.env.EMBEDDING_ENABLED = 'false';
 process.env.BOT_TOKEN = '123456:TEST';
 process.env.OWNER_TELEGRAM_ID = '777777';
 process.env.DB_PATH = ':memory:';
 process.env.DEV_AUTH_BYPASS = 'false';
-process.env.OPENROUTER_API_KEY = '';
+process.env.OPENROUTER_API_KEY = 'test-key';
+process.env.JEV_DAILY_CALL_CAP = '100';
+process.env.JEV_DAILY_USD_CAP = '10';
+process.env.JEV_MONTHLY_USD_CAP = '100';
 
 const { createApp } = await import('../src/app.js');
 const { getDatabase } = await import('../src/db/client.js');
 const { createLoginToken } = await import('../src/services/auth.service.js');
+const { setSetting } = await import('../src/db/queries.js');
 
 const app = createApp();
+const db = getDatabase();
 
 function cookieFrom(response: Response): string {
-  const raw = response.headers.get('set-cookie') ?? '';
-  return raw.split(';')[0] ?? '';
+  return (response.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
 }
 
 async function login(): Promise<string> {
-  const login = createLoginToken(getDatabase());
+  const loginToken = createLoginToken(db);
   const response = await app.request('/auth/code', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: login.code }),
+    body: JSON.stringify({ code: loginToken.code }),
   });
   assert.equal(response.status, 200);
   const cookie = cookieFrom(response);
@@ -33,146 +36,258 @@ async function login(): Promise<string> {
   return cookie;
 }
 
-test('health is public and API is session-gated', async () => {
+async function json(path: string, cookie: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: any }> {
+  const response = await app.request(path, {
+    method: init.method ?? 'GET',
+    headers: { 'content-type': 'application/json', cookie },
+    ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+  });
+  let body: unknown = null;
+  try { body = await response.json(); } catch { /* empty */ }
+  return { status: response.status, body };
+}
+
+test('health is public and magic-link / 8-character code auth is HttpOnly', async () => {
   const health = await app.request('/api/health');
   assert.equal(health.status, 200);
-  const payload = (await health.json()) as { ok: boolean; botMode: string; jevMode: string };
+  const payload = (await health.json()) as { ok: boolean; jevMode: string; jevModel: string };
   assert.equal(payload.ok, true);
-  assert.equal(payload.botMode, 'polling');
-  assert.equal(payload.jevMode, 'gated');
+  assert.equal(payload.jevMode, 'auto');
+  assert.equal(payload.jevModel, 'typesafe/jev-1.14');
+  assert.equal((await app.request('/api/captures')).status, 401);
 
-  const unauthorized = await app.request('/api/captures');
-  assert.equal(unauthorized.status, 401);
-});
-
-test('magic-link and short-code login exchange for an HttpOnly session', async () => {
-  const loginToken = createLoginToken(getDatabase());
+  const loginToken = createLoginToken(db);
+  assert.equal(loginToken.code.replace(/[^A-Z0-9]/g, '').length, 8);
   const codeResponse = await app.request('/auth/code', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ code: loginToken.code.toLowerCase() }),
   });
   assert.equal(codeResponse.status, 200);
-  assert.equal((codeResponse.headers.get('set-cookie') ?? '').toLowerCase().includes('httponly'), true);
+  assert.match((codeResponse.headers.get('set-cookie') ?? '').toLowerCase(), /httponly/);
+  const reused = await app.request('/auth/code', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: loginToken.code }),
+  });
+  assert.equal(reused.status, 401);
 
-  const magic = createLoginToken(getDatabase());
+  const magic = createLoginToken(db);
   const magicResponse = await app.request(`/auth/login?token=${magic.token}`);
   assert.equal(magicResponse.status, 302);
   assert.ok(magicResponse.headers.get('set-cookie'));
-
-  const reused = await app.request(`/auth/login?token=${magic.token}`);
-  assert.equal(reused.status, 401);
 });
 
-test('full capture CRUD, hybrid search, head filters, override and triage', async () => {
+test('dual-mode capture, edit-anything patch, decisions, edges, bulk, views and export', async () => {
   const cookie = await login();
+  setSetting(db, 'jev_mode', 'off');
 
-  const created = await app.request('/api/captures', {
+  const manual = await json('/api/captures', cookie, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ content: 'A reusable mechanism for local decision probes #architecture' }),
+    body: {
+      mode: 'manual',
+      content: 'manual **markdown** capture',
+      bucket: 'idea',
+      status: 'active',
+      isPinned: false,
+      tags: ['manual'],
+      sourceUrl: 'https://example.com/a',
+      urlTitle: 'A title',
+      urlExcerpt: 'An excerpt',
+      decisions: { leverage: { valueNum: 2 } },
+    },
   });
-  assert.equal(created.status, 201);
-  const createdBody = (await created.json()) as { kind: string; captureReturn: { id: string; bucket: string } };
-  assert.equal(createdBody.kind, 'capture');
-  const id = createdBody.captureReturn.id;
+  assert.equal(manual.status, 201);
+  assert.equal(manual.body.jevUsed, false);
+  assert.equal(manual.body.capture.captureMode, 'manual');
+  assert.equal(manual.body.capture.decisions.leverage.source, 'human');
+  const manualId = manual.body.capture.id as string;
 
-  const list = (await (
-    await app.request('/api/captures?q=reusable', { headers: { cookie } })
-  ).json()) as { captures: Array<{ id: string }>; total: number };
-  assert.ok(list.captures.some((capture) => capture.id === id));
+  const auto = await json('/api/captures', cookie, { method: 'POST', body: { content: 'auto capture with #fts' } });
+  assert.equal(auto.status, 201);
+  assert.equal(auto.body.capture.captureMode, 'auto');
+  assert.deepEqual(auto.body.capture.decisions, {});
+  const autoId = auto.body.capture.id as string;
 
-  const all = (await (await app.request('/api/captures', { headers: { cookie } })).json()) as {
-    captures: Array<{ id: string }>;
-  };
-  assert.ok(all.captures.some((capture) => capture.id === id));
+  const search = await json(`/api/captures?q=${encodeURIComponent('b:idea #fts')}`, cookie);
+  assert.equal(search.status, 200);
+  assert.ok(search.body.captures.some((capture: { id: string }) => capture.id === autoId));
 
-  const filters = encodeURIComponent(JSON.stringify([{ head: 'leverage', min: 0 }]));
-  const filtered = await app.request(`/api/captures?headFilters=${filters}`, { headers: { cookie } });
-  assert.equal(filtered.status, 200);
-
-  const heads = (await (await app.request('/api/heads', { headers: { cookie } })).json()) as {
-    heads: Array<{ id: string; name: string }>;
-  };
-  const bucketHead = heads.heads.find((head) => head.name === 'bucket');
-  assert.ok(bucketHead);
-
-  const override = await app.request(`/api/captures/${id}/override`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ headId: bucketHead!.id, valueText: 'memory' }),
-  });
-  assert.equal(override.status, 200);
-  const overridden = (await override.json()) as { bucket: string };
-  assert.equal(overridden.bucket, 'memory');
-
-  const patched = await app.request(`/api/captures/${id}`, {
+  const patched = await json(`/api/captures/${manualId}`, cookie, {
     method: 'PATCH',
-    headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ isPinned: true, tags: ['manual'] }),
+    body: {
+      content: 'new content #should-not-resurrect',
+      bucket: 'reference',
+      status: 'archived',
+      isPinned: true,
+      tags: ['manual'],
+      reminder: { dueAt: Date.now() + 60_000, state: 'notified', snoozeCount: 3 },
+      decisions: { leverage: null, actionable: { valueText: 'yes', valueNum: 1 } },
+      meta: { edited: true },
+      createdAt: Date.parse('2026-02-02T00:00:00Z'),
+    },
   });
   assert.equal(patched.status, 200);
-  const patchedBody = (await patched.json()) as { isPinned: boolean; tags: string[] };
-  assert.equal(patchedBody.isPinned, true);
-  assert.ok(patchedBody.tags.includes('manual'));
+  assert.equal(patched.body.bucket, 'reference');
+  assert.equal(patched.body.status, 'archived');
+  assert.equal(patched.body.isPinned, true);
+  assert.deepEqual(patched.body.tags, ['manual']);
+  assert.equal(patched.body.decisions.leverage, undefined);
+  assert.equal(patched.body.decisions.actionable.source, 'human');
+  assert.equal(patched.body.reminder.snoozeCount, 3);
+  assert.deepEqual(patched.body.meta, { edited: true });
 
-  const detail = await app.request(`/api/captures/${id}`, { headers: { cookie } });
-  assert.equal(detail.status, 200);
-
-  const triage = await app.request('/api/triage', { headers: { cookie } });
-  assert.equal(triage.status, 200);
-  const triageBody = (await triage.json()) as Record<string, unknown>;
-  for (const key of ['uncertain', 'paradoxes', 'zombies', 'expiring']) assert.ok(key in triageBody);
-
-  const graph = await app.request('/api/graph', { headers: { cookie } });
-  assert.equal(graph.status, 200);
-
-  const telemetry = (await (await app.request('/api/telemetry', { headers: { cookie } })).json()) as {
-    rssMb: number;
-    caps: { dailyCalls: number };
-    headStats: Array<{ name: string }>;
-  };
-  assert.ok(telemetry.rssMb > 0);
-  assert.equal(telemetry.caps.dailyCalls, 30);
-  assert.ok(telemetry.headStats.some((head) => head.name === 'bucket'));
-
-  const playground = await app.request('/api/heads/test', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ text: 'Is this falsifiable? Maybe tomorrow at 9am.' }),
+  const parent = await json('/api/captures', cookie, {
+    method: 'POST', body: { mode: 'manual', content: 'edge parent', bucket: 'idea', status: 'active', isPinned: false, tags: [] },
   });
-  assert.equal(playground.status, 200);
+  const parentId = parent.body.capture.id as string;
+  const edgeAdded = await json(`/api/captures/${manualId}/edges`, cookie, {
+    method: 'POST', body: { targetId: parentId, relation: 'refines', note: 'human link' },
+  });
+  assert.equal(edgeAdded.status, 201);
+  const detail = await json(`/api/captures/${manualId}`, cookie);
+  assert.equal(detail.body.edges.length, 1);
+  assert.equal(detail.body.edges[0].otherContent, 'edge parent');
+  assert.equal(detail.body.edges[0].direction, 'outgoing');
+  const edgeRemoved = await json(`/api/captures/${manualId}/edges`, cookie, {
+    method: 'DELETE', body: { targetId: parentId, relation: 'refines' },
+  });
+  assert.equal(edgeRemoved.status, 200);
+  assert.equal(edgeRemoved.body.edges.length, 0);
 
-  const deleted = await app.request(`/api/captures/${id}`, { method: 'DELETE', headers: { cookie } });
-  assert.equal(deleted.status, 200);
-  const gone = await app.request(`/api/captures/${id}`, { headers: { cookie } });
-  assert.equal(gone.status, 404);
+  const cleared = await json('/api/captures', cookie, {
+    method: 'POST', body: { mode: 'manual', content: 'clear me', bucket: 'idea', status: 'active', isPinned: false, tags: [] },
+  });
+  const clearId = cleared.body.capture.id as string;
+  const removedDecision = await json(`/api/captures/${clearId}/decisions/head-bucket`, cookie, { method: 'DELETE' });
+  assert.equal(removedDecision.status, 200);
+  assert.equal(removedDecision.body.decisions.bucket, undefined);
 
-  const logout = await app.request('/auth/logout', { method: 'POST', headers: { cookie } });
-  assert.equal(logout.status, 200);
-  const afterLogout = await app.request('/api/captures', { headers: { cookie } });
-  assert.equal(afterLogout.status, 401);
+  const bulk = await json('/api/captures/bulk', cookie, {
+    method: 'POST', body: { ids: [manualId, autoId], action: { type: 'addTags', value: ['bulk'] } },
+  });
+  assert.equal(bulk.status, 200);
+  assert.equal(bulk.body.affected, 2);
+
+  const view = await json('/api/views', cookie, { method: 'POST', body: { name: 'Test view', query: 'b:idea' } });
+  assert.equal(view.status, 201);
+  const viewUpdate = await json(`/api/views/${view.body.id}`, cookie, { method: 'PATCH', body: { query: 'b:memory' } });
+  assert.equal(viewUpdate.body.query, 'b:memory');
+  assert.equal((await json(`/api/views/${view.body.id}`, cookie, { method: 'DELETE' })).status, 200);
+
+  const exportJson = await app.request('/api/export?format=json', { headers: { cookie } });
+  assert.equal(exportJson.status, 200);
+  assert.match(exportJson.headers.get('content-disposition') ?? '', /attachment/);
+  const exportBody = (await exportJson.json()) as { captures: unknown[]; tags: unknown[]; decisions: unknown[]; reminders: unknown[]; edges: unknown[] };
+  for (const key of ['captures', 'tags', 'decisions', 'reminders', 'edges']) assert.ok(Array.isArray(exportBody[key]));
+  const exportMd = await app.request('/api/export?format=md', { headers: { cookie } });
+  assert.match(await exportMd.text(), /BLINKO\/\/OS export/);
 });
 
-test('SSE stream connects and emits the connected event', async () => {
+test('Jev re-evaluation syncs bucket and human override immediately clears the review queue', async () => {
   const cookie = await login();
+  setSetting(db, 'jev_mode', 'auto');
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { questions?: Record<string, { type: string }> };
+    const answers: Record<string, unknown> = {};
+    for (const [key, question] of Object.entries(body.questions ?? {})) {
+      if (question.type === 'choice') {
+        answers[key] = {
+          type: 'choice', choice: 'question', confidence: 0.2,
+          probabilities: { idea: 0.2, memory: 0.2, reminder: 0.2, question: 0.2, reference: 0.1, noise: 0.1 },
+        };
+      } else if (question.type === 'score') {
+        answers[key] = { type: 'score', score: 1, confidence: 0.5, legend: {}, probabilities: { 0: 0.2, 1: 0.6, 2: 0.1, 3: 0.1 } };
+      } else {
+        answers[key] = { type: 'noul', noul: 0.5 };
+      }
+    }
+    return new Response(JSON.stringify({ model: 'typesafe/jev-1.14-test', answers, usage: { input_tokens: 10, output_tokens: 2, cost: 0.0001 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const created = await json('/api/captures', cookie, { method: 'POST', body: { content: 'uncertain routing probe' } });
+    assert.equal(created.status, 201);
+    const id = created.body.capture.id as string;
+    assert.equal(created.body.capture.bucket, 'question');
+    assert.equal(created.body.capture.decisions.bucket.source, 'jev');
+
+    const review = await json('/api/review', cookie);
+    const reviewItem = review.body.uncertain.find((item: { id: string }) => item.id === id);
+    assert.ok(reviewItem);
+
+    const overrides = Object.fromEntries(
+      (reviewItem.reviewDecisions as Array<{ headId: string; valueText: string | null; valueNum: number | null }>).map((decision) => [
+        decision.headId,
+        { valueText: decision.headId === 'head-bucket' ? 'idea' : (decision.valueText ?? 'yes'), valueNum: decision.valueNum ?? 1 },
+      ]),
+    );
+    const override = await json(`/api/captures/${id}`, cookie, { method: 'PATCH', body: { decisions: overrides } });
+    assert.equal(override.status, 200);
+    assert.equal(override.body.bucket, 'idea');
+    assert.equal(override.body.decisions.bucket.source, 'human');
+    const after = await json('/api/review', cookie);
+    assert.equal(after.body.uncertain.some((item: { id: string }) => item.id === id), false);
+
+    const forced = await json(`/api/captures/${id}/jev`, cookie, { method: 'POST', body: { headIds: ['head-bucket'] } });
+    assert.equal(forced.status, 200);
+    assert.equal(forced.body.capture.bucket, 'question');
+  } finally {
+    globalThis.fetch = original;
+    setSetting(db, 'jev_mode', 'off');
+  }
+});
+
+test('agenda, head CRUD with full config, settings firewall and SSE stream', async () => {
+  const cookie = await login();
+  setSetting(db, 'jev_mode', 'off');
+
+  const reminder = await json('/api/captures', cookie, {
+    method: 'POST',
+    body: { mode: 'manual', content: 'overdue agenda item', bucket: 'reminder', status: 'active', isPinned: false, tags: [], reminderDueAt: Date.now() - 1000 },
+  });
+  assert.equal(reminder.status, 201);
+  const agenda = await json('/api/agenda', cookie);
+  assert.ok(agenda.body.overdue.some((item: { captureId: string }) => item.captureId === reminder.body.capture.id));
+
+  const choiceHead = await json('/api/heads', cookie, {
+    method: 'POST',
+    body: {
+      name: 'Priority', primitive: 'choice', instructions: 'Pick a priority',
+      config: { options: [{ value: 'low', description: 'low impact' }, { value: 'high', description: 'high impact' }] },
+      entropyThreshold: 0.4, sortOrder: 9, active: true,
+    },
+  });
+  assert.equal(choiceHead.status, 201);
+  assert.equal(choiceHead.body.config.options.length, 2);
+  const patchedHead = await json(`/api/heads/${choiceHead.body.id}`, cookie, {
+    method: 'PATCH',
+    body: { entropyThreshold: 0.7, config: { min: 0, max: 4, rubric: { 0: 'a', 1: 'b', 2: 'c', 3: 'd', 4: 'e' } }, primitive: 'score' },
+  });
+  assert.equal(patchedHead.body.primitive, 'score');
+  assert.equal(patchedHead.body.entropyThreshold, 0.7);
+  assert.equal(patchedHead.body.config.rubric['4'], 'e');
+  assert.equal((await json(`/api/heads/${choiceHead.body.id}`, cookie, { method: 'DELETE' })).status, 200);
+
+  const badSetting = await json('/api/settings', cookie, { method: 'PATCH', body: { jev_mode: 'gated' } });
+  assert.equal(badSetting.status, 400);
+  const goodSetting = await json('/api/settings', cookie, { method: 'PATCH', body: { jev_mode: 'off' } });
+  assert.equal(goodSetting.body.settings.jev_mode, 'off');
+
   const controller = new AbortController();
   const response = await app.request('/api/events', { headers: { cookie }, signal: controller.signal });
   assert.equal(response.status, 200);
   const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
   let buffer = '';
   const timeout = setTimeout(() => controller.abort(), 2000);
   try {
     while (!buffer.includes('event: connected')) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buffer += new TextDecoder().decode(value, { stream: true });
     }
   } finally {
     clearTimeout(timeout);
     controller.abort();
-    reader.cancel().catch(() => undefined);
+    await reader.cancel().catch(() => undefined);
   }
   assert.ok(buffer.includes('event: connected'));
 });

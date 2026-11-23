@@ -2,16 +2,14 @@ import { serve } from '@hono/node-server';
 import { config } from './config.js';
 import { createApp } from './app.js';
 import { closeDatabase, getDatabase } from './db/client.js';
-import { createBot, sendSchedulerReminder } from './bot/bot.js';
+import { createBot } from './bot/bot.js';
 import { startBotTransport, stopBotTransport } from './bot/transport.js';
 import { startScheduler, stopScheduler } from './engine/scheduler.js';
-import { hydrateVectorIndex } from './engine/embeddings.js';
 import { initCapturesService } from './services/captures.service.js';
 
 async function main(): Promise<void> {
   const db = getDatabase();
   initCapturesService(db);
-  hydrateVectorIndex(db);
 
   const bot = createBot();
   const app = createApp(bot);
@@ -22,7 +20,7 @@ async function main(): Promise<void> {
     console.log(`[Server] Bot mode: ${config.BOT_MODE} · TZ: ${config.OWNER_TIMEZONE}`);
   });
 
-  startScheduler(db, { notifyReminder: sendSchedulerReminder });
+  startScheduler(db, bot);
 
   try {
     await startBotTransport(bot);

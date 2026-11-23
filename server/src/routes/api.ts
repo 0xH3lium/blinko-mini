@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { nanoid } from 'nanoid';
 import { z } from 'zod';
@@ -6,54 +6,197 @@ import type Database from 'better-sqlite3';
 import { config } from '../config.js';
 import { getDatabase } from '../db/client.js';
 import {
-  BUCKETS,
-  getCapture,
-  getCaptureRow,
+  createSavedView,
+  deleteSavedView,
+  getCaptureDetail,
   getHeadRow,
   getReminder,
-  getSetting,
-  latestDecisionsFor,
+  getReviewQueue,
   getSettings,
-  insertDecision,
+  getAgenda,
+  headFromRow,
   jevUsageTotals,
   listCaptures,
   listEdgesForCapture,
   listHeads,
-  listReminders,
+  listSavedViews,
   listTags,
-  localHitRate,
   setSetting,
+  updateSavedView,
   type Bucket,
   type CaptureFilters,
-  type HeadFilter,
+  type CaptureSort,
+  type EdgeRelation,
   type HeadRow,
 } from '../db/queries.js';
-import { initCapturesService, ServiceError } from '../services/captures.service.js';
-import { ingestCapture } from '../engine/pipeline.js';
-import { runDeterministic, lexicalFeatures } from '../engine/deterministic.js';
-import { embed, vectorIndex } from '../engine/embeddings.js';
-import { buildFeatureVector, predictHead, recordAgreement, trainStep } from '../engine/localProbe.js';
-import { evaluateHeads, getJevMode, canSpendJev } from '../engine/jev.js';
-import { effectiveEnergyFor, survivalBuckets } from '../engine/physics.js';
+import { getCapturesService, initCapturesService, ServiceError } from '../services/captures.service.js';
+import { createCaptureManual, ingestCaptureAuto, type PipelineResult } from '../engine/pipeline.js';
+import { runDeterministic } from '../engine/deterministic.js';
+import { canSpendJev, estimateSweepCostUsd, evaluateHeads, getJevMode } from '../engine/jev.js';
 import { emit, subscribe } from '../services/events.service.js';
 import { sessionAuth } from '../middleware/sessionAuth.js';
 
 const db = (): Database.Database => getDatabase();
 const captures = () => initCapturesService(db());
 
-const bucketEnum = z.enum(['idea', 'memory', 'reminder', 'question', 'reference', 'noise']);
-const statusEnum = z.enum(['active', 'resolved', 'sublimated']);
+const bucketSchema = z.enum(['idea', 'memory', 'reminder', 'question', 'reference', 'noise']);
+const statusSchema = z.enum(['active', 'resolved', 'archived']);
+const relationSchema = z.enum(['reply', 'related', 'refines', 'supports', 'blocks', 'answers']);
+const sourceUrlSchema = z.union([z.string().url(), z.null()]);
+const metaSchema = z.record(z.unknown());
+const decisionPatchSchema = z.union([
+  z.object({ valueText: z.string().nullable().optional(), valueNum: z.number().nullable().optional() }).strict(),
+  z.null(),
+]);
 
-function fail(c: { json: (body: unknown, status: 400) => Response }, message: string): Response {
-  return c.json({ error: message }, 400);
+const createCaptureSchema = z.preprocess(
+  (value) => (value && typeof value === 'object' && !('mode' in value) ? { ...value, mode: 'auto' } : value),
+  z.discriminatedUnion('mode', [
+    z
+      .object({
+        mode: z.literal('auto'),
+        content: z.string().min(1),
+        skipUrlFetch: z.boolean().optional(),
+        forceJev: z.boolean().optional(),
+      })
+      .strict(),
+    z
+      .object({
+        mode: z.literal('manual'),
+        content: z.string().min(1),
+        bucket: bucketSchema.default('idea'),
+        status: statusSchema.default('active'),
+        isPinned: z.boolean().default(false),
+        tags: z.array(z.string()).default([]),
+        sourceUrl: sourceUrlSchema.optional(),
+        urlTitle: z.string().nullable().optional(),
+        urlExcerpt: z.string().nullable().optional(),
+        meta: metaSchema.optional(),
+        createdAt: z.number().int().optional(),
+        reminderDueAt: z.number().int().nullable().optional(),
+        decisions: z.record(decisionPatchSchema).optional(),
+        links: z
+          .array(
+            z
+              .object({ targetId: z.string(), relation: relationSchema, note: z.string().nullable().optional() })
+              .strict(),
+          )
+          .optional(),
+        fetchUrl: z.boolean().optional(),
+      })
+      .strict(),
+  ]),
+);
+
+const updateCaptureSchema = z
+  .object({
+    content: z.string().min(1).optional(),
+    bucket: bucketSchema.optional(),
+    status: statusSchema.optional(),
+    isPinned: z.boolean().optional(),
+    captureMode: z.enum(['auto', 'manual']).optional(),
+    tags: z.array(z.string()).optional(),
+    sourceUrl: sourceUrlSchema.optional(),
+    urlTitle: z.string().nullable().optional(),
+    urlExcerpt: z.string().nullable().optional(),
+    meta: metaSchema.optional(),
+    createdAt: z.number().int().optional(),
+    reminder: z
+      .union([
+        z
+          .object({
+            dueAt: z.number().int(),
+            state: z.enum(['pending', 'notified', 'done', 'killed']).optional(),
+            snoozeCount: z.number().int().min(0).optional(),
+          })
+          .strict(),
+        z.null(),
+      ])
+      .optional(),
+    decisions: z.record(decisionPatchSchema).optional(),
+  })
+  .strict();
+
+const bulkActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('bucket'), value: bucketSchema }),
+  z.object({ type: z.literal('status'), value: statusSchema }),
+  z.object({ type: z.literal('isPinned'), value: z.boolean() }),
+  z.object({ type: z.literal('addTags'), value: z.array(z.string()) }),
+  z.object({ type: z.literal('removeTags'), value: z.array(z.string()) }),
+  z.object({ type: z.literal('delete') }),
+  z.object({ type: z.literal('runJev') }),
+]);
+const bulkSchema = z.object({ ids: z.array(z.string()).min(1), action: bulkActionSchema }).strict();
+
+const choiceConfigSchema = z
+  .object({
+    options: z
+      .array(z.object({ value: z.string().min(1), description: z.string().optional().default('') }).strict())
+      .min(1)
+      .max(20),
+  })
+  .strict();
+const scoreConfigSchema = z
+  .object({
+    min: z.number().int().min(0),
+    max: z.number().int(),
+    rubric: z.record(z.string()),
+  })
+  .strict()
+  .refine((config) => config.max > config.min && config.max - config.min <= 9, {
+    message: 'score range must contain 2–10 levels',
+  });
+const noulConfigSchema = z.object({}).strict();
+
+const headBase = {
+  name: z.string().min(1).max(50),
+  instructions: z.string().min(1),
+  entropyThreshold: z.number().min(0).max(1).default(0.55),
+  sortOrder: z.number().int().default(0),
+  active: z.boolean().default(true),
+};
+const createHeadSchema = z.discriminatedUnion('primitive', [
+  z.object({ ...headBase, primitive: z.literal('choice'), config: choiceConfigSchema }).strict(),
+  z.object({ ...headBase, primitive: z.literal('score'), config: scoreConfigSchema }).strict(),
+  z.object({ ...headBase, primitive: z.literal('noul'), config: noulConfigSchema }).strict(),
+]);
+
+const sweepSchema = z
+  .object({ q: z.string().optional(), onlyMissing: z.boolean().default(false) })
+  .strict();
+
+const viewSchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    query: z.string().default(''),
+    sort: z.string().default('recent'),
+    sortOrder: z.number().int().default(0),
+  })
+  .strict();
+
+function fail(c: Context, message: string, status: 400 | 404 | 429 = 400): Response {
+  return c.json({ error: message }, status);
 }
 
-async function jsonBody(c: { req: { json: () => Promise<unknown> } }): Promise<unknown> {
+async function readBody(c: Context): Promise<unknown> {
+  const raw = await c.req.text();
+  if (!raw.trim()) return {};
   try {
-    return await c.req.json();
+    return JSON.parse(raw) as unknown;
   } catch {
     throw new ServiceError('Request body must be valid JSON');
   }
+}
+
+function validateHeadConfig(primitive: 'choice' | 'score' | 'noul', value: unknown): Record<string, unknown> {
+  const schema = primitive === 'choice' ? choiceConfigSchema : primitive === 'score' ? scoreConfigSchema : noulConfigSchema;
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) throw new ServiceError(`Invalid ${primitive} config: ${parsed.error.issues[0]?.message ?? 'invalid'}`);
+  return parsed.data as Record<string, unknown>;
+}
+
+function normalizeHeadName(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
 }
 
 export const apiRoutes = new Hono();
@@ -64,6 +207,7 @@ apiRoutes.get('/health', (c) =>
     botMode: config.BOT_MODE,
     rssMb: Math.round(process.memoryUsage().rss / 1_048_576),
     jevMode: getJevMode(db()),
+    jevModel: config.JEV_MODEL,
   }),
 );
 
@@ -75,9 +219,7 @@ apiRoutes.get('/events', (c) =>
     const unsubscribe = subscribe((event) => {
       void stream.writeSSE({ event: event.type, data: JSON.stringify(event.data), id: String(++id) });
     });
-    const heartbeat = setInterval(() => {
-      void stream.write(': heartbeat\n\n');
-    }, 25_000);
+    const heartbeat = setInterval(() => void stream.write(': heartbeat\n\n'), 25_000);
     stream.onAbort(() => {
       clearInterval(heartbeat);
       unsubscribe();
@@ -87,380 +229,457 @@ apiRoutes.get('/events', (c) =>
   }),
 );
 
-apiRoutes.get('/captures', async (c) => {
-  const query = c.req.query();
+apiRoutes.get('/captures', (c) => {
+  const query = z
+    .object({
+      q: z.string().optional(),
+      bucket: bucketSchema.optional(),
+      status: z.union([statusSchema, z.literal('all')]).default('active'),
+      tag: z.string().optional(),
+      sort: z.union([z.enum(['recent', 'updated', 'due', 'entropy']), z.string().startsWith('head:')]).optional(),
+      order: z.enum(['asc', 'desc']).optional(),
+      limit: z.coerce.number().int().min(1).max(500).default(100),
+      offset: z.coerce.number().int().min(0).default(0),
+    })
+    .safeParse(c.req.query());
+  if (!query.success) return fail(c, 'Invalid query parameters');
   const filters: CaptureFilters = {
-    status: query.status === 'all' ? undefined : (statusEnum.safeParse(query.status).success ? (query.status as 'active') : 'active'),
-    limit: query.limit ? Number(query.limit) : 100,
-    offset: query.offset ? Number(query.offset) : 0,
+    ...(query.data.q ? { q: query.data.q } : {}),
+    ...(query.data.bucket ? { bucket: query.data.bucket } : {}),
+    status: query.data.status,
+    ...(query.data.tag ? { tag: query.data.tag } : {}),
+    ...(query.data.sort ? { sort: query.data.sort as CaptureSort } : {}),
+    ...(query.data.order ? { order: query.data.order } : {}),
+    limit: query.data.limit,
+    offset: query.data.offset,
   };
-  if (query.bucket && BUCKETS.includes(query.bucket as Bucket)) filters.bucket = query.bucket as Bucket;
-  if (query.tag) filters.tag = query.tag;
-  if (query.q) filters.q = query.q;
-  if (query.paradoxOnly === 'true') filters.paradoxOnly = true;
-  if (query.minResonance) filters.minResonance = Number(query.minResonance);
-  if (query.minEnergy) filters.minEnergy = Number(query.minEnergy);
-  if (query.maxEnergy) filters.maxEnergy = Number(query.maxEnergy);
-  if (query.sort) filters.sort = query.sort as CaptureFilters['sort'];
-  if (query.headFilters) {
-    try {
-      const parsed = z
-        .array(z.object({ head: z.string(), min: z.number().optional(), max: z.number().optional() }))
-        .safeParse(JSON.parse(query.headFilters));
-      if (parsed.success) filters.headFilters = parsed.data as HeadFilter[];
-    } catch {
-      return fail(c, 'headFilters must be valid JSON');
-    }
-  }
-  if (query.q) {
-    const vec = await embed(query.q);
-    filters.semantic = vectorIndex.search(vec, 200).map((item) => ({ id: item.id, score: item.score }));
-  }
   return c.json(captures().list(filters));
 });
 
-apiRoutes.get('/captures/:id', (c) => {
-  const id = c.req.param('id');
-  const capture = getCapture(db(), id);
-  if (!capture) return c.json({ error: 'Capture not found' }, 404);
-  return c.json({
-    ...captures().get(id),
-    edges: listEdgesForCapture(db(), id),
-    reminder: getReminder(db(), id) ?? null,
-    effectiveEnergy: effectiveEnergyFor(db(), getCaptureRow(db(), id)!),
-  });
+apiRoutes.post('/captures/bulk', async (c) => {
+  const parsed = bulkSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid bulk action');
+  return c.json(await captures().bulkAction(parsed.data.ids, parsed.data.action));
 });
 
 apiRoutes.post('/captures', async (c) => {
-  const body = (await jsonBody(c)) as { content?: unknown };
-  if (typeof body.content !== 'string' || body.content.trim().length === 0) {
-    return fail(c, 'content must be a non-empty string');
+  const parsed = createCaptureSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, `Invalid capture: ${parsed.error.issues[0]?.message ?? 'bad request'}`);
+  const body = parsed.data;
+  let result: PipelineResult;
+  if (body.mode === 'manual') {
+    result = await createCaptureManual(db(), {
+      content: body.content,
+      bucket: body.bucket,
+      status: body.status,
+      isPinned: body.isPinned,
+      tags: body.tags,
+      sourceUrl: body.sourceUrl ?? null,
+      urlTitle: body.urlTitle ?? null,
+      urlExcerpt: body.urlExcerpt ?? null,
+      meta: body.meta ?? {},
+      createdAt: body.createdAt,
+      reminderDueAt: body.reminderDueAt ?? null,
+      decisions: body.decisions,
+      links: body.links,
+      fetchUrl: body.fetchUrl,
+    });
+  } else {
+    result = await ingestCaptureAuto(db(), {
+      content: body.content,
+      skipUrlFetch: body.skipUrlFetch,
+      forceJev: body.forceJev,
+    });
   }
-  const result = await ingestCapture(db(), { content: body.content, forceJev: (body as { forceJev?: boolean }).forceJev });
   return c.json(result, 201);
 });
 
+apiRoutes.get('/captures/:id', (c) => {
+  const detail = getCaptureDetail(db(), c.req.param('id'));
+  if (!detail) return fail(c, 'Capture not found', 404);
+  return c.json({ ...detail, reminder: getReminder(db(), detail.id) ?? null });
+});
+
 apiRoutes.patch('/captures/:id', async (c) => {
-  const body = (await jsonBody(c)) as Record<string, unknown>;
-  const content = typeof body.content === 'string' ? body.content : undefined;
-  const bucket = bucketEnum.safeParse(body.bucket).success ? (body.bucket as Bucket) : undefined;
-  const status = statusEnum.safeParse(body.status).success ? (body.status as 'active') : undefined;
-  const isPinned = typeof body.isPinned === 'boolean' ? body.isPinned : undefined;
-  const tags = Array.isArray(body.tags) ? body.tags.filter((tag): tag is string => typeof tag === 'string') : undefined;
-  const reminderDueAt =
-    body.reminderDueAt === null ? null : typeof body.reminderDueAt === 'number' ? body.reminderDueAt : undefined;
-  const updated = captures().update(c.req.param('id'), {
-    ...(content !== undefined ? { content } : {}),
-    ...(bucket !== undefined ? { bucket } : {}),
-    ...(status !== undefined ? { status } : {}),
-    ...(isPinned !== undefined ? { isPinned } : {}),
-    ...(tags !== undefined ? { tags } : {}),
-    ...(reminderDueAt !== undefined ? { reminderDueAt } : {}),
-  });
-  if (!updated) return c.json({ error: 'Capture not found' }, 404);
+  const parsed = updateCaptureSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, `Invalid patch: ${parsed.error.issues[0]?.message ?? 'bad request'}`);
+  const updated = captures().update(c.req.param('id'), parsed.data);
+  if (!updated) return fail(c, 'Capture not found', 404);
   return c.json(updated);
 });
 
 apiRoutes.delete('/captures/:id', (c) => {
-  const id = c.req.param('id');
-  if (!captures().remove(id)) return c.json({ error: 'Capture not found' }, 404);
-  return c.json({ deleted: true, id });
+  if (!captures().remove(c.req.param('id'))) return fail(c, 'Capture not found', 404);
+  return c.json({ deleted: true, id: c.req.param('id') });
 });
 
 apiRoutes.post('/captures/:id/override', async (c) => {
-  const body = (await jsonBody(c)) as { headId?: unknown; valueText?: unknown; valueNum?: unknown };
-  if (typeof body.headId !== 'string') return fail(c, 'headId is required');
+  const parsed = z
+    .object({
+      headId: z.string().min(1),
+      valueText: z.string().nullable().optional(),
+      valueNum: z.number().nullable().optional(),
+    })
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'headId is required');
   const updated = captures().override(
     c.req.param('id'),
-    body.headId,
-    typeof body.valueText === 'string' ? body.valueText : undefined,
-    typeof body.valueNum === 'number' ? body.valueNum : undefined,
+    parsed.data.headId,
+    parsed.data.valueText ?? undefined,
+    parsed.data.valueNum ?? undefined,
   );
-  if (!updated) return c.json({ error: 'Capture not found' }, 404);
+  if (!updated) return fail(c, 'Capture not found', 404);
+  return c.json(updated);
+});
+
+apiRoutes.delete('/captures/:id/decisions/:headId', (c) => {
+  const updated = captures().clearDecision(c.req.param('id'), c.req.param('headId'));
+  if (!updated) return fail(c, 'Capture not found', 404);
   return c.json(updated);
 });
 
 apiRoutes.post('/captures/:id/jev', async (c) => {
-  const id = c.req.param('id');
-  const capture = getCapture(db(), id);
-  const row = getCaptureRow(db(), id);
-  if (!capture || !row) return c.json({ error: 'Capture not found' }, 404);
-  const heads = listHeads(db(), true).map((head) => getHeadRow(db(), head.id)).filter((item): item is HeadRow => !!item);
-  const result = await evaluateHeads(db(), capture.content, heads, 'manual');
-  if (!result) return c.json({ error: 'Jev unavailable or budget capped', budget: canSpendJev(db()) }, 429);
-  const embedding = row.embedding
-    ? new Float32Array(Buffer.from(row.embedding).buffer, 0, 384)
-    : await embed(capture.content);
-  const x = buildFeatureVector(embedding, lexicalFeatures(capture.content, null));
-  for (const prediction of result.predictions) {
-    const head = heads.find((item) => item.id === prediction.headId);
-    if (!head) continue;
-    insertDecision(db(), {
-      captureId: id,
-      headId: head.id,
-      valueText: prediction.valueText,
-      valueNum: prediction.valueNum,
-      probs: prediction.probs,
-      confidence: prediction.confidence,
-      entropy: prediction.entropy,
-      source: 'jev',
-      latencyMs: result.latencyMs,
-    });
-    trainStep(db(), head, x, { valueText: prediction.valueText, valueNum: prediction.valueNum }, 1);
+  const parsed = z.object({ headIds: z.array(z.string()).optional() }).safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid Jev request');
+  try {
+    const result = await captures().reevaluateWithJev(c.req.param('id'), parsed.data.headIds);
+    if (!result) return fail(c, 'Capture not found', 404);
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof ServiceError && error.status === 429) return fail(c, error.message, 429);
+    throw error;
   }
-  emit('capture.updated', getCapture(db(), id));
-  return c.json({ ok: true, usage: result });
 });
 
-apiRoutes.get('/triage', (c) => {
-  const now = Date.now();
-  const active = listCaptures(db(), { status: 'active', limit: 500 }).captures;
-  const withDecisions = active.map((capture) => ({
-    capture,
-    decisions: db()
-      .prepare(
-        `SELECT cd.entropy, dh.name AS head_name FROM capture_decisions cd JOIN decision_heads dh ON dh.id = cd.head_id
-         WHERE cd.capture_id = ? ORDER BY cd.created_at DESC`,
-      )
-      .all(capture.id) as Array<{ entropy: number; head_name: string }>,
-    energy: effectiveEnergyFor(db(), getCaptureRow(db(), capture.id)!),
-  }));
-  const uncertain = withDecisions
-    .filter((item) => item.decisions.some((decision) => decision.entropy > 0.55))
-    .slice(0, 20)
-    .map((item) => ({ ...item.capture, decisions: item.decisions }));
-  const paradox = listCaptures(db(), { status: 'active', paradoxOnly: true, limit: 50 }).captures;
-  const zombies = listReminders(db()).filter((reminder) => reminder.snoozeCount >= 4 || reminder.state === 'notified');
-  const threshold = Number(getSetting(db(), 'sublimate_energy', '0.15'));
-  const expiring = withDecisions
-    .filter((item) => item.energy < threshold * 2 && !item.capture.isPinned)
-    .slice(0, 30)
-    .map((item) => ({ ...item.capture, effectiveEnergy: item.energy }));
-  void now;
-  return c.json({ uncertain, paradoxes: paradox, zombies, expiring });
+apiRoutes.post('/captures/:id/fetch-url', async (c) => {
+  const parsed = z.object({ url: z.string().url().optional() }).safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid URL');
+  const updated = await captures().fetchUrlMetadata(c.req.param('id'), parsed.data.url);
+  if (!updated) return fail(c, 'Capture not found', 404);
+  return c.json(updated);
 });
 
-apiRoutes.get('/graph', (c) => {
-  const rows = listCaptures(db(), { status: 'active', limit: 1000 }).captures;
-  const decisions = latestDecisionsFor(db(), rows.map((capture) => capture.id));
-  const nodes = rows.map((capture) => ({
-    ...capture,
-    effectiveEnergy: effectiveEnergyFor(db(), getCaptureRow(db(), capture.id)!),
-    decisions: decisions.get(capture.id) ?? [],
-  }));
-  const rawEdges = db().prepare('SELECT * FROM capture_edges').all() as Array<{
-    source_id: string; target_id: string; relation: string; weight: number; meta: string; created_at: number;
-  }>;
-  const edges = rawEdges.map((row) => ({
-    sourceId: row.source_id,
-    targetId: row.target_id,
-    relation: row.relation,
-    weight: row.weight,
-    meta: JSON.parse(row.meta || '{}') as Record<string, unknown>,
-    createdAt: row.created_at,
-  }));
-  return c.json({ nodes, edges });
+apiRoutes.post('/captures/:id/edges', async (c) => {
+  const parsed = z
+    .object({ targetId: z.string().min(1), relation: relationSchema, note: z.string().nullable().optional() })
+    .strict()
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid edge');
+  try {
+    captures().addEdge(c.req.param('id'), parsed.data.targetId, parsed.data.relation, parsed.data.note);
+  } catch (error) {
+    if (error instanceof ServiceError) return fail(c, error.message, error.status);
+    throw error;
+  }
+  return c.json({ edges: listEdgesForCapture(db(), c.req.param('id')) }, 201);
 });
+
+apiRoutes.delete('/captures/:id/edges', async (c) => {
+  const parsed = z
+    .object({ targetId: z.string().min(1), relation: relationSchema })
+    .strict()
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid edge');
+  captures().removeEdge(c.req.param('id'), parsed.data.targetId, parsed.data.relation);
+  return c.json({ edges: listEdgesForCapture(db(), c.req.param('id')) });
+});
+
+apiRoutes.get('/review', (c) => c.json(getReviewQueue(db())));
+
+apiRoutes.get('/agenda', (c) => c.json(getAgenda(db())));
 
 apiRoutes.get('/heads', (c) => c.json({ heads: listHeads(db()) }));
 
+apiRoutes.post('/heads/test', async (c) => {
+  const parsed = z
+    .object({
+      text: z.string().min(1),
+      url: z.string().url().optional(),
+      headIds: z.array(z.string()).optional(),
+    })
+    .strict()
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'text is required');
+  const deterministic = await runDeterministic(parsed.data.text);
+  const heads = (parsed.data.headIds ?? [])
+    .flatMap((key) => {
+      const head = getHeadRow(db(), key) ?? db().prepare('SELECT * FROM decision_heads WHERE name = ?').get(key);
+      return head ? [head as HeadRow] : [];
+    })
+    .filter((head) => head.active === 1);
+  const activeHeads = heads.length > 0 ? heads : listHeads(db(), true).map((head) => getHeadRow(db(), head.id)!).filter(Boolean);
+  const state = {
+    content: deterministic.text,
+    tags: deterministic.tags,
+    ...(deterministic.sourceUrl
+      ? {
+          url: {
+            url: deterministic.sourceUrl,
+            title: deterministic.urlTitle ?? '',
+            excerpt: deterministic.urlExcerpt ?? '',
+          },
+        }
+      : parsed.data.url
+        ? { url: { url: parsed.data.url, title: '', excerpt: '' } }
+        : {}),
+  };
+  const jev = await evaluateHeads(db(), state, activeHeads, 'playground');
+  return c.json({ deterministic, jev });
+});
+
 apiRoutes.post('/heads', async (c) => {
-  const body = (await jsonBody(c)) as Record<string, unknown>;
-  const name = typeof body.name === 'string' ? body.name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_') : '';
-  const primitive = body.primitive;
+  const parsed = createHeadSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, `Invalid head: ${parsed.error.issues[0]?.message ?? 'bad request'}`);
+  const data = parsed.data;
+  const name = normalizeHeadName(data.name);
   if (!name) return fail(c, 'name is required');
-  if (primitive !== 'choice' && primitive !== 'score' && primitive !== 'noul') return fail(c, 'invalid primitive');
-  const configJson =
-    primitive === 'score'
-      ? { min: 0, max: 3, rubric: { 0: 'low', 1: 'medium', 2: 'high', 3: 'maximum' } }
-      : primitive === 'choice'
-        ? { options: [{ value: 'yes', description: 'yes' }, { value: 'no', description: 'no' }] }
-        : {};
   const id = nanoid();
   try {
-    db().prepare(
-      `INSERT INTO decision_heads (id, name, primitive, instructions, config_json, auto_escalate, local_threshold,
-        sample_count, agreement_count, eval_count, active, is_system, created_at)
-       VALUES (?, ?, ?, ?, ?, 1, 0.86, 0, 0, 0, 1, 0, ?)`,
-    ).run(
-      id,
-      name,
-      primitive,
-      typeof body.instructions === 'string' ? body.instructions : name,
-      JSON.stringify(body.config ?? configJson),
-      Date.now(),
-    );
+    db()
+      .prepare(
+        `INSERT INTO decision_heads
+           (id, name, primitive, instructions, config_json, entropy_threshold, active, is_system, sort_order, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      )
+      .run(
+        id,
+        name,
+        data.primitive,
+        data.instructions,
+        JSON.stringify(data.config),
+        data.entropyThreshold,
+        data.active ? 1 : 0,
+        data.sortOrder,
+        Date.now(),
+      );
   } catch {
     return fail(c, 'a head with that name already exists');
   }
-  return c.json(listHeads(db()).find((head) => head.id === id), 201);
+  const head = getHeadRow(db(), id);
+  return c.json(head ? headFromRow(head) : null, 201);
 });
 
 apiRoutes.patch('/heads/:id', async (c) => {
-  const body = (await jsonBody(c)) as Record<string, unknown>;
   const head = getHeadRow(db(), c.req.param('id'));
-  if (!head) return c.json({ error: 'Head not found' }, 404);
+  if (!head) return fail(c, 'Head not found', 404);
+  const parsed = z
+    .object({
+      name: z.string().min(1).max(50).optional(),
+      instructions: z.string().min(1).optional(),
+      primitive: z.enum(['choice', 'score', 'noul']).optional(),
+      config: z.unknown().optional(),
+      entropyThreshold: z.number().min(0).max(1).optional(),
+      sortOrder: z.number().int().optional(),
+      active: z.boolean().optional(),
+    })
+    .strict()
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid head patch');
+  const primitive = parsed.data.primitive ?? head.primitive;
+  let config: Record<string, unknown> | undefined;
+  try {
+    if (parsed.data.config !== undefined) config = validateHeadConfig(primitive, parsed.data.config);
+    else if (primitive !== head.primitive) config = validateHeadConfig(primitive, JSON.parse(head.config_json) as unknown);
+  } catch (error) {
+    return fail(c, error instanceof Error ? error.message : 'Invalid config');
+  }
+
   const sets: string[] = [];
   const params: unknown[] = [];
-  if (typeof body.instructions === 'string') { sets.push('instructions = ?'); params.push(body.instructions); }
-  if (typeof body.active === 'boolean') { sets.push('active = ?'); params.push(body.active ? 1 : 0); }
-  if (typeof body.autoEscalate === 'boolean') { sets.push('auto_escalate = ?'); params.push(body.autoEscalate ? 1 : 0); }
-  if (typeof body.localThreshold === 'number') { sets.push('local_threshold = ?'); params.push(body.localThreshold); }
-  if (body.config && typeof body.config === 'object') { sets.push('config_json = ?'); params.push(JSON.stringify(body.config)); }
-  if (sets.length === 0) return c.json(listHeads(db()).find((item) => item.id === head.id));
-  params.push(head.id);
-  db().prepare(`UPDATE decision_heads SET ${sets.join(', ')} WHERE id = ?`).run(...params);
-  return c.json(listHeads(db()).find((item) => item.id === head.id));
+  if (parsed.data.name !== undefined) {
+    sets.push('name = ?');
+    params.push(normalizeHeadName(parsed.data.name));
+  }
+  if (parsed.data.instructions !== undefined) {
+    sets.push('instructions = ?');
+    params.push(parsed.data.instructions);
+  }
+  if (parsed.data.primitive !== undefined) {
+    sets.push('primitive = ?');
+    params.push(primitive);
+  }
+  if (config !== undefined) {
+    sets.push('config_json = ?');
+    params.push(JSON.stringify(config));
+  }
+  if (parsed.data.entropyThreshold !== undefined) {
+    sets.push('entropy_threshold = ?');
+    params.push(parsed.data.entropyThreshold);
+  }
+  if (parsed.data.sortOrder !== undefined) {
+    sets.push('sort_order = ?');
+    params.push(parsed.data.sortOrder);
+  }
+  if (parsed.data.active !== undefined) {
+    sets.push('active = ?');
+    params.push(parsed.data.active ? 1 : 0);
+  }
+  if (sets.length > 0) {
+    params.push(head.id);
+    db().prepare(`UPDATE decision_heads SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+  }
+  const updated = getHeadRow(db(), head.id);
+  return c.json(updated ? headFromRow(updated) : null);
 });
 
 apiRoutes.delete('/heads/:id', (c) => {
-  const head = getHeadRow(db(), c.req.param('id'));
-  if (!head) return c.json({ error: 'Head not found' }, 404);
-  if (head.is_system === 1) return fail(c, 'system heads cannot be deleted; deactivate them instead');
-  db().prepare('DELETE FROM decision_heads WHERE id = ?').run(head.id);
+  const result = db().prepare('DELETE FROM decision_heads WHERE id = ?').run(c.req.param('id'));
+  if (result.changes === 0) return fail(c, 'Head not found', 404);
   return c.json({ deleted: true });
 });
 
-function sweepIds(head: HeadRow, body: Record<string, unknown>): string[] {
-  const where = ['c.status = ?'];
-  const params: unknown[] = ['active'];
-  if (typeof body.bucket === 'string' && BUCKETS.includes(body.bucket as Bucket)) {
-    where.push('c.bucket = ?');
-    params.push(body.bucket);
-  }
-  if (typeof body.days === 'number' && body.days > 0) {
-    where.push('c.created_at >= ?');
-    params.push(Date.now() - body.days * 86_400_000);
-  }
-  if (typeof body.minEnergy === 'number') {
-    where.push('c.energy >= ?');
-    params.push(body.minEnergy);
-  }
-  if (body.onlyMissing === true) {
-    where.push('NOT EXISTS (SELECT 1 FROM capture_decisions cd WHERE cd.capture_id = c.id AND cd.head_id = ?)');
-    params.push(head.id);
-  }
-  return (db().prepare(`SELECT c.id FROM captures c WHERE ${where.join(' AND ')} LIMIT 500`).all(...params) as Array<{ id: string }>).map(
-    (row) => row.id,
-  );
+function sweepTargets(head: HeadRow, q: string, onlyMissing: boolean): Array<{ id: string; content: string }> {
+  const page = listCaptures(db(), { q, status: 'active', limit: 500 });
+  return page.captures
+    .filter((capture) => !onlyMissing || !Object.values(capture.decisions).some((decision) => decision.headId === head.id))
+    .map((capture) => ({ id: capture.id, content: capture.content }));
 }
 
 apiRoutes.post('/heads/:id/sweep/preview', async (c) => {
   const head = getHeadRow(db(), c.req.param('id'));
-  if (!head) return c.json({ error: 'Head not found' }, 404);
-  const body = (await jsonBody(c)) as Record<string, unknown>;
-  const ids = sweepIds(head, body);
-  return c.json({ count: ids.length, estimatedUsd: Number((ids.length * 0.0008).toFixed(4)), cap: canSpendJev(db()) });
+  if (!head) return fail(c, 'Head not found', 404);
+  const parsed = sweepSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid sweep request');
+  const targets = sweepTargets(head, parsed.data.q ?? '', parsed.data.onlyMissing);
+  const instructionsChars = head.instructions.length + head.config_json.length;
+  return c.json({
+    count: targets.length,
+    estimatedUsd: estimateSweepCostUsd(
+      targets.map((target) => target.content),
+      instructionsChars,
+    ),
+    cap: canSpendJev(db()),
+  });
 });
 
 apiRoutes.post('/heads/:id/sweep/run', async (c) => {
   const head = getHeadRow(db(), c.req.param('id'));
-  if (!head) return c.json({ error: 'Head not found' }, 404);
-  const body = (await jsonBody(c)) as Record<string, unknown>;
-  const ids = sweepIds(head, body);
+  if (!head) return fail(c, 'Head not found', 404);
+  const parsed = sweepSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid sweep request');
+  const targets = sweepTargets(head, parsed.data.q ?? '', parsed.data.onlyMissing);
   void (async () => {
     let done = 0;
-    for (const id of ids) {
-      if (!canSpendJev(db()).ok) break;
-      const capture = getCapture(db(), id);
-      const row = getCaptureRow(db(), id);
-      if (!capture || !row) continue;
-      const result = await evaluateHeads(db(), capture.content, [head], 'sweep');
-      if (result) {
-        const prediction = result.predictions[0];
-        if (prediction) {
-          insertDecision(db(), {
-            captureId: id,
-            headId: head.id,
-            valueText: prediction.valueText,
-            valueNum: prediction.valueNum,
-            probs: prediction.probs,
-            confidence: prediction.confidence,
-            entropy: prediction.entropy,
-            source: 'jev',
-            latencyMs: result.latencyMs,
-          });
-          const embedding = row.embedding
-            ? new Float32Array(Buffer.from(row.embedding).buffer, 0, 384)
-            : await embed(capture.content);
-          trainStep(db(), head, buildFeatureVector(embedding, lexicalFeatures(capture.content, null)), {
-            valueText: prediction.valueText,
-            valueNum: prediction.valueNum,
-          }, 1);
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < targets.length) {
+        const target = targets[cursor];
+        cursor += 1;
+        if (!target) continue;
+        try {
+          await captures().reevaluateWithJev(target.id, [head.id]);
+        } catch {
+          // Individual failures are surfaced by the Jev call itself.
         }
+        done += 1;
+        emit('sweep.progress', { headId: head.id, done, total: targets.length });
       }
-      done += 1;
-      emit('sweep.progress', { headId: head.id, done, total: ids.length });
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(5, targets.length) }, () => worker()));
   })().catch((error: unknown) => console.error('[Sweep] failed:', error));
-  return c.json({ started: true, count: ids.length });
+  return c.json({ started: true, count: targets.length });
 });
 
-apiRoutes.post('/heads/test', async (c) => {
-  const body = (await jsonBody(c)) as { text?: unknown; useJev?: unknown };
-  if (typeof body.text !== 'string' || !body.text.trim()) return fail(c, 'text is required');
-  const deterministic = await runDeterministic(body.text);
-  const embedding = await embed(deterministic.text);
-  const x = buildFeatureVector(embedding, deterministic.features);
-  const heads = listHeads(db(), true).map((head) => getHeadRow(db(), head.id)).filter((item): item is HeadRow => !!item);
-  const local = heads.map((head) => {
-    const started = Date.now();
-    const prediction = predictHead(db(), head, x);
-    return { headId: head.id, name: head.name, primitive: head.primitive, latencyMs: Date.now() - started, ...prediction };
-  });
-  let jev = null;
-  if (body.useJev === true) jev = await evaluateHeads(db(), deterministic.text, heads, 'manual');
-  return c.json({ deterministic, local, jev });
+apiRoutes.get('/views', (c) => c.json({ views: listSavedViews(db()) }));
+
+apiRoutes.post('/views', async (c) => {
+  const parsed = viewSchema.safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid view');
+  const view = createSavedView(db(), { id: nanoid(), ...parsed.data });
+  return c.json(view, 201);
+});
+
+apiRoutes.patch('/views/:id', async (c) => {
+  const parsed = viewSchema.partial().safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'Invalid view patch');
+  const view = updateSavedView(db(), c.req.param('id'), parsed.data);
+  if (!view) return fail(c, 'View not found', 404);
+  return c.json(view);
+});
+
+apiRoutes.delete('/views/:id', (c) => {
+  if (!deleteSavedView(db(), c.req.param('id'))) return fail(c, 'View not found', 404);
+  return c.json({ deleted: true });
 });
 
 apiRoutes.get('/telemetry', (c) => {
-  const heads = listHeads(db());
-  const headStats = heads.map((head) => ({
+  const usage = jevUsageTotals(db());
+  const headRows = listHeads(db());
+  const stats = db()
+    .prepare(
+      `SELECT head_id, COUNT(*) AS decisions, AVG(entropy) AS avg_entropy, AVG(confidence) AS avg_confidence
+       FROM capture_decisions GROUP BY head_id`,
+    )
+    .all() as Array<{ head_id: string; decisions: number; avg_entropy: number; avg_confidence: number }>;
+  const statMap = new Map(stats.map((stat) => [stat.head_id, stat]));
+  const headStats = headRows.map((head) => ({
     id: head.id,
     name: head.name,
     primitive: head.primitive,
-    sampleCount: head.sampleCount,
-    evalCount: head.evalCount,
-    agreement: head.evalCount > 0 ? head.agreementCount / head.evalCount : 0,
     active: head.active,
+    entropyThreshold: head.entropyThreshold,
+    decisions: statMap.get(head.id)?.decisions ?? 0,
+    avgEntropy: statMap.get(head.id)?.avg_entropy ?? 0,
+    avgConfidence: statMap.get(head.id)?.avg_confidence ?? 0,
   }));
-  const usage = jevUsageTotals(db());
   return c.json({
     rssMb: Math.round(process.memoryUsage().rss / 1_048_576),
     heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1_048_576),
-    vectorCount: vectorIndex.size(),
     jevMode: getJevMode(db()),
+    jevModel: config.JEV_MODEL,
     caps: {
       dailyCalls: config.JEV_DAILY_CALL_CAP,
       dailyUsd: config.JEV_DAILY_USD_CAP,
       monthlyUsd: config.JEV_MONTHLY_USD_CAP,
+      priceUsdPerMillion: 0.042,
     },
     usageToday: usage.todayCalls,
     usageTodayUsd: usage.todayUsd,
     usageMonthUsd: usage.monthUsd,
-    localHitRate: localHitRate(db()),
+    totalCaptures: (db().prepare('SELECT COUNT(*) AS count FROM captures').get() as { count: number }).count,
+    bucketCounts: captures().list({ status: 'all', limit: 1 }).bucketCounts,
     headStats,
-    survivalBuckets: survivalBuckets(db()),
     settings: getSettings(db()),
     tags: listTags(db()),
   });
 });
 
 apiRoutes.patch('/settings', async (c) => {
-  const body = (await jsonBody(c)) as Record<string, unknown>;
-  const settable = ['jev_mode', 'bootstrap_target', 'collision_min_cos', 'resonance_min_cos', 'sublimate_energy'];
-  for (const [key, value] of Object.entries(body)) {
-    if (!settable.includes(key)) continue;
-    if (key === 'jev_mode' && value !== 'gated' && value !== 'bootstrap' && value !== 'off') {
-      return fail(c, 'jev_mode must be gated, bootstrap or off');
-    }
-    setSetting(db(), key, String(value));
-  }
-  emit('telemetry.updated', getSettings(db()));
-  return c.json({ settings: getSettings(db()) });
+  const parsed = z
+    .object({ jev_mode: z.enum(['auto', 'off']) })
+    .strict()
+    .safeParse(await readBody(c));
+  if (!parsed.success) return fail(c, 'jev_mode must be auto or off');
+  setSetting(db(), 'jev_mode', parsed.data.jev_mode);
+  const settings = getSettings(db());
+  emit('telemetry.updated', settings);
+  return c.json({ settings });
 });
 
-apiRoutes.get('/tags', (c) => c.json({ tags: listTags(db()) }));
+apiRoutes.get('/export', (c) => {
+  const format = z.enum(['json', 'md']).safeParse(c.req.query('format') ?? 'json');
+  if (!format.success) return fail(c, 'format must be json or md');
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    captures: captures().list({ status: 'all', limit: 500 }).captures,
+    tags: db().prepare('SELECT name FROM tags ORDER BY name').all(),
+    decisions: db().prepare('SELECT * FROM capture_decisions').all(),
+    reminders: db().prepare('SELECT * FROM reminders').all(),
+    edges: db().prepare('SELECT * FROM capture_edges').all(),
+  };
+  if (format.data === 'json') {
+    return c.body(JSON.stringify(payload), 200, {
+      'Content-Type': 'application/json',
+      'Content-Disposition': 'attachment; filename="blinko-backup.json"',
+    });
+  }
+  const lines = payload.captures.map((capture) => `## [${capture.bucket}] ${new Date(capture.createdAt).toISOString()}\n\n${capture.content}`);
+  const markdown = `# BLINKO//OS export\n\n${lines.join('\n\n')}\n`;
+  return c.body(markdown, 200, {
+    'Content-Type': 'text/markdown; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="blinko-backup.md"',
+  });
+});
 
 apiRoutes.onError((error, c) => {
   if (error instanceof ServiceError) return c.json({ error: error.message }, error.status);

@@ -9,7 +9,6 @@ import { authRoutes } from './routes/auth.js';
 import { apiRoutes } from './routes/api.js';
 import { mountWebhookRoute } from './bot/transport.js';
 import { initCapturesService } from './services/captures.service.js';
-import { hydrateVectorIndex } from './engine/embeddings.js';
 import { cleanupExpiredTokens } from './services/auth.service.js';
 
 const webDist = resolve(config.PROJECT_ROOT, 'web/dist');
@@ -18,7 +17,6 @@ const indexHtml = resolve(webDist, 'index.html');
 export function createApp(bot?: Bot): Hono {
   const db = getDatabase();
   initCapturesService(db);
-  hydrateVectorIndex(db);
   cleanupExpiredTokens(db);
 
   const app = new Hono();

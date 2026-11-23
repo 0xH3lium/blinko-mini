@@ -1,25 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowRight, Command, Search, Sparkles } from 'lucide-react';
+import { ArrowRight, Command, Download, Search, Sparkles, Wand2, Zap } from 'lucide-react';
+import { exportUrl, getCaptures } from '../api/client';
 import type { Capture, Mode } from '../types/capture';
-import { getCaptures } from '../api/client';
 import { cn } from '../lib/utils';
 
 export function CommandPalette({
-  open,
-  onClose,
-  onSelect,
-  onCapture,
-  onMode,
-  onToggleJev,
-  onCollide,
+  open, onClose, onSelect, onCaptureAuto, onCaptureManual, onMode, onToggleJev, onForceJev, selectedId,
 }: {
   open: boolean;
   onClose: () => void;
   onSelect: (capture: Capture) => void;
-  onCapture: () => void;
+  onCaptureAuto: () => void;
+  onCaptureManual: () => void;
   onMode: (mode: Mode) => void;
   onToggleJev: () => void;
-  onCollide: () => void;
+  onForceJev: (id: string) => void;
+  selectedId: string | null;
 }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Capture[]>([]);
@@ -56,12 +52,22 @@ export function CommandPalette({
 
   if (!open) return null;
 
-  const actions: Array<{ label: string; hint: string; run: () => void }> = [
-    { label: 'Create capture', hint: 'new', run: onCapture },
-    { label: 'Switch to Topology', hint: '2', run: () => onMode('topology') },
-    { label: 'Switch to Triage', hint: '3', run: () => onMode('triage') },
-    { label: 'Toggle Jev mode', hint: 'gated/bootstrap/off', run: onToggleJev },
-    { label: 'Run collision scan', hint: '/collide', run: onCollide },
+  const actions: Array<{ label: string; hint: string; icon: React.ReactNode; run: () => void; disabled?: boolean }> = [
+    { label: 'New Capture (Auto)', hint: 'auto', icon: <Sparkles size={12} />, run: onCaptureAuto },
+    { label: 'New Capture (Manual)', hint: '⌘M', icon: <Wand2 size={12} />, run: onCaptureManual },
+    { label: 'Switch to Stream', hint: '1', icon: <Command size={12} />, run: () => onMode('stream') },
+    { label: 'Switch to Agenda & Matrix', hint: '2', icon: <Command size={12} />, run: () => onMode('agenda') },
+    { label: 'Switch to Review', hint: '3', icon: <Command size={12} />, run: () => onMode('review') },
+    { label: 'Switch to Jev Lab', hint: '4', icon: <Command size={12} />, run: () => onMode('jev') },
+    { label: 'Toggle Jev Auto/Off', hint: 'settings', icon: <Zap size={12} />, run: onToggleJev },
+    { label: 'Export JSON', hint: 'backup', icon: <Download size={12} />, run: () => window.open(exportUrl('json'), '_blank') },
+    {
+      label: 'Force Jev recalculation',
+      hint: selectedId ? 'selected' : 'no selection',
+      icon: <Zap size={12} />,
+      disabled: !selectedId,
+      run: () => { if (selectedId) onForceJev(selectedId); },
+    },
   ];
 
   return (
@@ -76,28 +82,21 @@ export function CommandPalette({
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
                 if (results[0]) { onSelect(results[0]); onClose(); }
-                else if (query.trim()) { onCapture(); onClose(); }
+                else if (query.trim()) { onCaptureAuto(); onClose(); }
               }
             }}
-            placeholder="Search captures (FTS5 + cosine) or type a command…"
+            placeholder="FTS5 + Query DSL search, or type a command…"
             className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-[var(--muted)]"
           />
           <span className="mono rounded border border-[var(--border)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">esc</span>
         </div>
 
-        <div className="max-h-[50vh] overflow-y-auto p-1.5">
+        <div className="max-h-[55vh] overflow-y-auto p-1.5">
           {query.trim() ? (
             <div>
-              <div className="px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
-                {busy ? 'Searching…' : `Captures · ${results.length}`}
-              </div>
+              <div className="px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">{busy ? 'Searching…' : `Captures · ${results.length}`}</div>
               {results.map((capture) => (
-                <button
-                  key={capture.id}
-                  type="button"
-                  onClick={() => { onSelect(capture); onClose(); }}
-                  className="flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)]"
-                >
+                <button key={capture.id} type="button" onClick={() => { onSelect(capture); onClose(); }} className="flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)]">
                   <span className="mono text-[9px] uppercase text-[var(--emerald)]">{capture.bucket.slice(0, 3)}</span>
                   <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text)]">{capture.content}</span>
                   <ArrowRight size={12} className="text-[var(--muted)]" />
@@ -112,18 +111,15 @@ export function CommandPalette({
             <button
               key={action.label}
               type="button"
+              disabled={action.disabled}
               onClick={() => { action.run(); onClose(); }}
-              className={cn('flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)]')}
+              className={cn('flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)] disabled:opacity-40')}
             >
-              <Command size={12} className="text-[var(--muted)]" />
+              <span className="text-[var(--muted)]">{action.icon}</span>
               <span className="flex-1 text-[12px] text-[var(--text)]">{action.label}</span>
               <span className="mono text-[10px] text-[var(--muted)]">{action.hint}</span>
             </button>
           ))}
-          <button type="button" onClick={() => { onCollide(); onClose(); }} className="flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)]">
-            <Sparkles size={12} className="text-[var(--amber)]" />
-            <span className="flex-1 text-[12px] text-[var(--text)]">Force Jev recalculation on selected</span>
-          </button>
         </div>
       </div>
     </div>

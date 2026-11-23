@@ -1,5 +1,2 @@
 export type ToastTone = 'success' | 'error' | 'info';
-
-export interface Notify {
-  (message: string, tone?: ToastTone): void;
-}
+export type Notify = (message: string, tone?: ToastTone) => void;

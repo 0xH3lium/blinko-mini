@@ -2,7 +2,7 @@ export type EventType =
   | 'capture.created'
   | 'capture.updated'
   | 'capture.deleted'
-  | 'edge.created'
+  | 'edge.updated'
   | 'reminder.updated'
   | 'telemetry.updated'
   | 'sweep.progress';

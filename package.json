@@ -15,7 +15,7 @@
     "start": "node server/dist/index.js",
     "test": "npm --workspace server run test",
     "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck",
-    "ram-check": "node server/scripts/ram-check.mjs"
+    "context": "node scripts/gen-context.mjs"
   },
   "engines": {
     "node": ">=20"

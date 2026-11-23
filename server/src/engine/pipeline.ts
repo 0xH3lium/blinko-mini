@@ -2,191 +2,287 @@ import type Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
 import {
   BUCKETS,
-  captureFromRow,
   getCapture,
   getCaptureRow,
+  getHeadByName,
   getHeadRow,
-  getSetting,
-  insertDecision,
+  getReminder,
   insertEdge,
   listHeads,
   setCaptureTags,
-  setSetting,
+  syncCaptureFts,
+  upsertDecision,
+  upsertReminder,
   type Bucket,
-  type CaptureRow,
+  type Capture,
+  type CaptureStatus,
+  type Decision,
+  type EdgeRelation,
   type HeadRow,
 } from '../db/queries.js';
-import { runDeterministic } from './deterministic.js';
-import { embed, vectorIndex, vectorToBlob } from './embeddings.js';
-import { buildFeatureVector, predictHead, recordAgreement, trainStep, type Prediction } from './localProbe.js';
-import { evaluateHeads, evaluatePairRelation, getJevMode } from './jev.js';
-import { decayLambdaForHalfLife } from './physics.js';
+import { runDeterministic, fetchReadable } from './deterministic.js';
+import { evaluateHeads, getJevMode, canSpendJev, type JevState } from './jev.js';
 import { emit } from '../services/events.service.js';
 
 const DEFAULT_REMINDER_DELAY_MS = 4 * 3_600_000;
 
-export interface IngestInput {
+export interface ManualDecisionInput {
+  valueText?: string | null;
+  valueNum?: number | null;
+}
+
+export interface ManualLinkInput {
+  targetId: string;
+  relation: EdgeRelation;
+  note?: string | null;
+}
+
+export interface CreateCaptureManualInput {
+  content: string;
+  bucket: Bucket;
+  status: CaptureStatus;
+  isPinned: boolean;
+  tags?: string[];
+  sourceUrl?: string | null;
+  urlTitle?: string | null;
+  urlExcerpt?: string | null;
+  meta?: Record<string, unknown>;
+  createdAt?: number;
+  reminderDueAt?: number | null;
+  reminderState?: 'pending' | 'notified' | 'done' | 'killed';
+  snoozeCount?: number;
+  decisions?: Record<string, ManualDecisionInput | null>;
+  links?: ManualLinkInput[];
+  fetchUrl?: boolean;
+}
+
+export interface IngestCaptureAutoInput {
   content: string;
   tgMessageId?: number;
   tgChatId?: number;
   replyToTgMessageId?: number;
+  skipUrlFetch?: boolean;
   forceJev?: boolean;
 }
 
-export interface CollisionPayload {
-  candidateId: string;
-  candidateContent: string;
-  relation: 'contradicts' | 'reinforces' | 'refines';
-  confidence: number;
+export interface PipelineResult {
+  capture: Capture | undefined;
+  bucketDecision: Decision | null;
+  reminderDueAt: number | null;
+  jevUsed: boolean;
 }
 
-export type IngestResult =
-  | { kind: 'resonance'; targetId: string; targetContent: string; count: number; firstSeenAt: number }
-  | {
-      kind: 'capture';
-      captureReturn: ReturnType<typeof getCapture>;
-      bucketPrediction: Prediction | null;
-      collision: CollisionPayload | null;
-      reminderDueAt: number | null;
-      jevUsed: boolean;
+function resolveHead(db: Database.Database, key: string): HeadRow | undefined {
+  return getHeadRow(db, key) ?? getHeadByName(db, key);
+}
+
+function humanDecision(
+  db: Database.Database,
+  captureId: string,
+  head: HeadRow,
+  valueText: string | null,
+  valueNum: number | null,
+): void {
+  const probs: Record<string, number> = valueText
+    ? { [valueText]: 1 }
+    : valueNum !== null
+      ? { [String(valueNum)]: 1 }
+      : {};
+  upsertDecision(db, {
+    captureId,
+    headId: head.id,
+    valueText,
+    valueNum,
+    probs,
+    confidence: 1,
+    entropy: 0,
+    source: 'human',
+  });
+}
+
+function syncBucketHead(db: Database.Database, captureId: string, bucket: Bucket, source: 'human' | 'deterministic'): void {
+  const head = getHeadByName(db, 'bucket');
+  if (!head) return;
+  upsertDecision(db, {
+    captureId,
+    headId: head.id,
+    valueText: bucket,
+    valueNum: null,
+    probs: { [bucket]: 1 },
+    confidence: 1,
+    entropy: 0,
+    source,
+  });
+}
+
+function bucketDecisionOf(capture: Capture | undefined, headId: string | undefined): Decision | null {
+  if (!capture || !headId) return null;
+  return Object.values(capture.decisions).find((decision) => decision.headId === headId) ?? null;
+}
+
+export function buildJevState(db: Database.Database, captureId: string): JevState {
+  const capture = getCapture(db, captureId);
+  const state: JevState = { content: capture?.content ?? '', tags: capture?.tags ?? [] };
+  if (capture?.sourceUrl) {
+    state.url = {
+      url: capture.sourceUrl,
+      title: capture.urlTitle ?? '',
+      excerpt: capture.urlExcerpt ?? '',
     };
-
-function updatedCapture(db: Database.Database, id: string) {
-  const row = getCaptureRow(db, id);
-  if (!row) return undefined;
-  return getCapture(db, id);
+  }
+  const parentRow = db
+    .prepare("SELECT source_id FROM capture_edges WHERE target_id = ? AND relation = 'reply' LIMIT 1")
+    .get(captureId) as { source_id: string } | undefined;
+  if (parentRow) {
+    const parent = getCaptureRow(db, parentRow.source_id);
+    if (parent) state.parentCapture = { bucket: parent.bucket, content: parent.content };
+  }
+  return state;
 }
 
-export async function ingestCapture(db: Database.Database, input: IngestInput): Promise<IngestResult> {
-  const content = input.content.trim();
+export async function createCaptureManual(db: Database.Database, input: CreateCaptureManualInput): Promise<PipelineResult> {
+  const id = nanoid();
   const now = Date.now();
-  const deterministic = await runDeterministic(content, new Date(now));
-  const embedding = await embed(deterministic.text);
-  const neighbors = vectorIndex.search(embedding, 5);
+  let sourceUrl = input.sourceUrl ?? null;
+  let urlTitle = input.urlTitle ?? null;
+  let urlExcerpt = input.urlExcerpt ?? null;
+  if (input.fetchUrl === true && sourceUrl && (!urlTitle || !urlExcerpt)) {
+    const readable = await fetchReadable(sourceUrl);
+    if (readable) {
+      sourceUrl = readable.url;
+      urlTitle = urlTitle || readable.title || null;
+      urlExcerpt = urlExcerpt || readable.excerpt || null;
+    }
+  }
 
-  const resonanceMin = Number(getSetting(db, 'resonance_min_cos', '0.91'));
-  const collisionMin = Number(getSetting(db, 'collision_min_cos', '0.68'));
-  const mode = getJevMode(db);
-  const isReply = input.replyToTgMessageId !== undefined;
+  const createdAt = input.createdAt ?? now;
+  db.prepare(
+    `INSERT INTO captures
+       (id, content, bucket, status, is_pinned, capture_mode, source_url, url_title, url_excerpt,
+        meta, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    input.content,
+    input.bucket,
+    input.status,
+    input.isPinned ? 1 : 0,
+    sourceUrl,
+    urlTitle,
+    urlExcerpt,
+    JSON.stringify(input.meta ?? {}),
+    createdAt,
+    now,
+  );
 
-  const neighborRows = neighbors
-    .map((neighbor) => ({ ...neighbor, row: getCaptureRow(db, neighbor.id) }))
-    .filter((item): item is { id: string; score: number; row: CaptureRow } => item.row !== undefined && item.row.status === 'active');
+  const run = db.transaction(() => {
+    setCaptureTags(db, id, input.tags ?? []);
+    for (const [key, value] of Object.entries(input.decisions ?? {})) {
+      const head = resolveHead(db, key);
+      if (!head || value === null || value === undefined) continue;
+      humanDecision(
+        db,
+        id,
+        head,
+        value.valueText ?? null,
+        value.valueNum ?? null,
+      );
+    }
+    syncBucketHead(db, id, input.bucket, 'human');
+    for (const link of input.links ?? []) {
+      if (link.targetId === id) continue;
+      const target = getCaptureRow(db, link.targetId);
+      if (!target) continue;
+      insertEdge(db, id, link.targetId, link.relation, link.note ?? null);
+    }
+    if (input.reminderDueAt !== undefined && input.reminderDueAt !== null) {
+      upsertReminder(db, id, {
+        dueAt: input.reminderDueAt,
+        state: input.reminderState ?? 'pending',
+        snoozeCount: input.snoozeCount ?? 0,
+      });
+    }
+    syncCaptureFts(db, id);
+  });
+  run();
 
-  // Resonance: near-duplicate merge without spending a Jev call.
-  const top = neighborRows[0];
-  if (!isReply && top && top.score >= resonanceMin) {
-    const meta = JSON.parse(top.row.meta) as Record<string, unknown>;
-    const resonances = Array.isArray(meta.resonances) ? meta.resonances : [];
-    resonances.push({ at: now, text: deterministic.text });
-    const nextMeta = JSON.stringify({ ...meta, resonances: resonances.slice(-20) });
-    const firstSeenAt = top.row.created_at;
-    db.prepare(
-      `UPDATE captures SET resonance_count = resonance_count + 1,
-         energy = MIN(2.0, energy + 0.5), last_activated_at = ?, meta = ?, updated_at = ? WHERE id = ?`,
-    ).run(now, nextMeta, now, top.row.id);
-    emit('capture.updated', updatedCapture(db, top.row.id));
-    return {
-      kind: 'resonance',
-      targetId: top.row.id,
-      targetContent: top.row.content,
-      count: top.row.resonance_count + 1,
-      firstSeenAt,
-    };
+  const capture = getCapture(db, id);
+  const head = getHeadByName(db, 'bucket');
+  emit('capture.created', capture);
+  return {
+    capture,
+    bucketDecision: bucketDecisionOf(capture, head?.id),
+    reminderDueAt: getReminder(db, id)?.dueAt ?? null,
+    jevUsed: false,
+  };
+}
+
+export async function ingestCaptureAuto(db: Database.Database, input: IngestCaptureAutoInput): Promise<PipelineResult> {
+  const deterministic = await runDeterministic(input.content, new Date(), input.skipUrlFetch === true);
+
+  if (deterministic.manualBypass) {
+    return createCaptureManual(db, {
+      content: deterministic.text,
+      bucket: deterministic.bucketHint ?? 'idea',
+      status: 'active',
+      isPinned: false,
+      tags: deterministic.tags,
+      sourceUrl: deterministic.sourceUrl,
+      urlTitle: deterministic.urlTitle,
+      urlExcerpt: deterministic.urlExcerpt,
+      meta: deterministic.meta,
+      reminderDueAt: deterministic.parsedDueAt,
+    });
   }
 
   const id = nanoid();
-  const simhash = deterministic.simhash;
+  const now = Date.now();
   db.prepare(
     `INSERT INTO captures
-      (id, content, bucket, status, is_pinned, energy, decay_lambda, resonance_count,
-       last_activated_at, simhash, embedding, meta, created_at, updated_at)
-     VALUES (?, ?, ?, 'active', 0, 1.0, 0.05, 1, ?, ?, ?, ?, ?, ?)`,
+       (id, content, bucket, status, is_pinned, capture_mode, source_url, url_title, url_excerpt,
+        meta, created_at, updated_at)
+     VALUES (?, ?, ?, 'active', 0, 'auto', ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
-    deterministic.text || content,
+    deterministic.text,
     deterministic.bucketHint ?? 'idea',
-    now,
-    simhash,
-    vectorToBlob(embedding),
+    deterministic.sourceUrl,
+    deterministic.urlTitle,
+    deterministic.urlExcerpt,
     JSON.stringify(deterministic.meta),
     now,
     now,
   );
-  setCaptureTags(db, id, deterministic.tags);
-  vectorIndex.upsert(id, embedding);
 
-  let tgMessageId: number | null = null;
+  setCaptureTags(db, id, deterministic.tags);
   if (input.tgMessageId !== undefined && input.tgChatId !== undefined) {
     db.prepare(
       `INSERT OR REPLACE INTO telegram_messages (tg_message_id, tg_chat_id, capture_id, role, created_at)
        VALUES (?, ?, ?, 'input', ?)`,
     ).run(input.tgMessageId, input.tgChatId, id, now);
-    tgMessageId = input.tgMessageId;
   }
-
-  // Reply edge (and optional Jev refinement).
-  if (isReply) {
+  if (input.replyToTgMessageId !== undefined) {
     const parent = db
       .prepare('SELECT capture_id FROM telegram_messages WHERE tg_message_id = ?')
-      .get(input.replyToTgMessageId!) as { capture_id: string } | undefined;
-    if (parent) {
-      insertEdge(db, id, parent.capture_id, 'reply', 1, {});
-      emit('edge.created', { sourceId: id, targetId: parent.capture_id, relation: 'reply' });
-      if (mode !== 'off') {
-        const parentRow = getCaptureRow(db, parent.capture_id);
-        if (parentRow) {
-          const relation = await evaluatePairRelation(db, deterministic.text, parentRow.content, 'reply');
-          if (relation && relation.relation !== 'unrelated') {
-            insertEdge(db, id, parent.capture_id, relation.relation, relation.confidence, { via: 'jev' });
-            emit('edge.created', { sourceId: id, targetId: parent.capture_id, relation: relation.relation });
-          }
-        }
-      }
-    }
+      .get(input.replyToTgMessageId) as { capture_id: string } | undefined;
+    if (parent && parent.capture_id !== id) insertEdge(db, id, parent.capture_id, 'reply', null);
   }
 
-  const headRows = listHeads(db, true).map((head) => getHeadRow(db, head.id)).filter((row): row is HeadRow => row !== undefined);
-  const x = buildFeatureVector(embedding, deterministic.features);
-  const local = new Map<string, Prediction>();
-  for (const head of headRows) {
-    const prediction = predictHead(db, head, x);
-    local.set(head.id, prediction);
-    insertDecision(db, {
-      captureId: id,
-      headId: head.id,
-      valueText: prediction.valueText,
-      valueNum: prediction.valueNum,
-      probs: prediction.probs,
-      confidence: prediction.confidence,
-      entropy: prediction.entropy,
-      source: prediction.isCold ? 'local_knn' : 'local_probe',
-      latencyMs: 0,
-    });
-  }
-
+  const headRows = listHeads(db, true)
+    .map((head) => getHeadRow(db, head.id))
+    .filter((head): head is HeadRow => head !== undefined);
   let jevUsed = false;
-  const shouldEscalate =
-    mode === 'bootstrap' ||
-    input.forceJev === true ||
-    (mode === 'gated' &&
-      headRows.some((head) => {
-        const prediction = local.get(head.id)!;
-        return (
-          head.auto_escalate === 1 &&
-          (prediction.isCold || prediction.confidence < head.local_threshold || prediction.entropy > 0.55)
-        );
-      }));
+  let bucket = deterministic.bucketHint ?? 'idea';
 
-  if (shouldEscalate && mode !== 'off') {
-    const result = await evaluateHeads(db, deterministic.text, headRows, input.forceJev ? 'manual' : 'entropy');
+  if (getJevMode(db) === 'auto' && canSpendJev(db).ok) {
+    const state = buildJevState(db, id);
+    const result = await evaluateHeads(db, state, headRows, input.forceJev ? 'manual' : 'auto');
     if (result) {
       jevUsed = true;
       for (const prediction of result.predictions) {
         const head = headRows.find((row) => row.id === prediction.headId);
         if (!head) continue;
-        const localPrediction = local.get(head.id);
-        insertDecision(db, {
+        upsertDecision(db, {
           captureId: id,
           headId: head.id,
           valueText: prediction.valueText,
@@ -195,104 +291,37 @@ export async function ingestCapture(db: Database.Database, input: IngestInput): 
           confidence: prediction.confidence,
           entropy: prediction.entropy,
           source: 'jev',
+          modelVersion: prediction.modelVersion,
           latencyMs: result.latencyMs,
         });
-        if (localPrediction) {
-          const agreed =
-            head.primitive === 'choice'
-              ? localPrediction.valueText === prediction.valueText
-              : Math.abs((localPrediction.valueNum ?? 0) - (prediction.valueNum ?? 0)) < 0.5;
-          recordAgreement(db, head.id, agreed);
-        }
-        trainStep(db, head, x, { valueText: prediction.valueText, valueNum: prediction.valueNum }, 1);
-        local.set(head.id, { ...prediction, isCold: false });
       }
-
-      if (mode === 'bootstrap') {
+      if (!deterministic.bucketHint) {
         const bucketHead = headRows.find((head) => head.name === 'bucket');
-        const target = Number(getSetting(db, 'bootstrap_target', '40'));
-        if (bucketHead) {
-          const refreshed = getHeadRow(db, bucketHead.id);
-          if (refreshed && refreshed.sample_count >= target) {
-            setSetting(db, 'jev_mode', 'gated');
-            emit('telemetry.updated', { jevMode: 'gated', reason: 'bootstrap target reached' });
-          }
+        const prediction = result.predictions.find((item) => item.headId === bucketHead?.id);
+        if (prediction?.valueText && BUCKETS.includes(prediction.valueText as Bucket)) {
+          bucket = prediction.valueText as Bucket;
         }
       }
     }
   }
 
-  // Apply bucket + half-life.
-  const bucketHead = headRows.find((head) => head.name === 'bucket');
-  const bucketPrediction = bucketHead ? local.get(bucketHead.id) ?? null : null;
-  let bucket: Bucket = deterministic.bucketHint ?? 'idea';
-  if (!deterministic.bucketHint && bucketPrediction?.valueText && BUCKETS.includes(bucketPrediction.valueText as Bucket)) {
-    bucket = bucketPrediction.valueText as Bucket;
+  if (deterministic.bucketHint) syncBucketHead(db, id, deterministic.bucketHint, 'deterministic');
+  db.prepare('UPDATE captures SET bucket = ?, updated_at = ? WHERE id = ?').run(bucket, Date.now(), id);
+
+  let reminderDueAt = deterministic.parsedDueAt;
+  if (!reminderDueAt && (bucket === 'reminder' || deterministic.bucketHint === 'reminder')) {
+    reminderDueAt = now + DEFAULT_REMINDER_DELAY_MS;
   }
+  if (reminderDueAt) upsertReminder(db, id, { dueAt: reminderDueAt });
+  syncCaptureFts(db, id);
 
-  const halfLifeHead = headRows.find((head) => head.name === 'half_life');
-  const halfLifePrediction = halfLifeHead ? local.get(halfLifeHead.id) : undefined;
-  let decayLambda = halfLifePrediction ? decayLambdaForHalfLife(halfLifePrediction.valueNum ?? 1) : 0.05;
-  if (bucket === 'memory') decayLambda = 0;
-
-  db.prepare('UPDATE captures SET bucket = ?, decay_lambda = ?, updated_at = ? WHERE id = ?').run(
-    bucket,
-    decayLambda,
-    Date.now(),
-    id,
-  );
-
-  // Reminder creation.
-  let reminderDueAt: number | null = deterministic.parsedDueAt;
-  if (!reminderDueAt && bucket === 'reminder') reminderDueAt = Date.now() + DEFAULT_REMINDER_DELAY_MS;
-  if (reminderDueAt) {
-    db.prepare(
-      `INSERT INTO reminders (capture_id, due_at, state) VALUES (?, ?, 'pending')
-       ON CONFLICT(capture_id) DO UPDATE SET due_at = excluded.due_at, state = 'pending'`,
-    ).run(id, reminderDueAt);
-  }
-
-  // Collision zone.
-  let collision: CollisionPayload | null = null;
-  if (mode !== 'off' && (bucket === 'idea' || bucket === 'question')) {
-    const candidate = neighborRows.find((item) => item.id !== id && item.score >= collisionMin && item.score < resonanceMin);
-    if (candidate) {
-      const relation = await evaluatePairRelation(db, deterministic.text, candidate.row.content, 'collision');
-      if (relation && relation.relation === 'contradicts' && relation.confidence >= 0.78) {
-        insertEdge(db, id, candidate.row.id, 'contradicts', relation.confidence, { via: 'jev' });
-        insertEdge(db, id, candidate.row.id, 'paradox', relation.confidence, { via: 'jev' });
-        collision = {
-          candidateId: candidate.row.id,
-          candidateContent: candidate.row.content,
-          relation: 'contradicts',
-          confidence: relation.confidence,
-        };
-      } else if (relation && (relation.relation === 'reinforces' || relation.relation === 'refines') && relation.confidence >= 0.75) {
-        insertEdge(db, id, candidate.row.id, relation.relation, relation.confidence, { via: 'jev' });
-        db.prepare('UPDATE captures SET energy = MIN(2.0, energy + 0.2), last_activated_at = ? WHERE id IN (?, ?)').run(
-          Date.now(),
-          id,
-          candidate.row.id,
-        );
-      }
-      if (relation && relation.relation !== 'unrelated') {
-        emit('edge.created', { sourceId: id, targetId: candidate.row.id, relation: relation.relation });
-      }
-    }
-  }
-
-  const created = updatedCapture(db, id);
-  emit('capture.created', created);
-  if (tgMessageId !== null) emit('telemetry.updated', { captureId: id });
-
+  const capture = getCapture(db, id);
+  const bucketHead = getHeadByName(db, 'bucket');
+  emit('capture.created', capture);
   return {
-    kind: 'capture',
-    captureReturn: created,
-    bucketPrediction,
-    collision,
+    capture,
+    bucketDecision: bucketDecisionOf(capture, bucketHead?.id),
     reminderDueAt,
     jevUsed,
   };
 }
-
-export { captureFromRow };

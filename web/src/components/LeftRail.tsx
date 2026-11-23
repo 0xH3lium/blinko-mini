@@ -1,5 +1,5 @@
-import { Activity, Brain, CircleHelp, Cpu, Hash, Lightbulb, Link2, RotateCcw, Sparkles, Timer, Waves } from 'lucide-react';
-import type { Bucket, Head, Telemetry } from '../types/capture';
+import { Activity, Brain, CircleHelp, Cpu, Hash, Lightbulb, Link2, Plus, Save, Timer, Trash2, Waves } from 'lucide-react';
+import type { Bucket, CaptureStatus, SavedView, Telemetry } from '../types/capture';
 import { cn } from '../lib/utils';
 
 const BUCKETS: Array<{ key: Bucket; label: string; icon: typeof Lightbulb }> = [
@@ -11,46 +11,28 @@ const BUCKETS: Array<{ key: Bucket; label: string; icon: typeof Lightbulb }> = [
   { key: 'noise', label: 'Noise', icon: Waves },
 ];
 
-export interface SmartFilters {
-  paradoxOnly?: boolean;
-  minResonance?: number;
-  decaying?: boolean;
-  sublimated?: boolean;
-}
-
 export function LeftRail({
-  counts,
-  activeBucket,
-  onBucket,
-  heads,
-  headValues,
-  onHeadValue,
-  tags,
-  activeTag,
-  onTag,
-  telemetry,
-  smart,
-  onSmart,
-  onOpenJev,
+  counts, activeBucket, onBucket, views, activeViewId, onView, onSaveView, onDeleteView,
+  tags, activeTag, onTag, telemetry, onOpenJev, status, onStatus,
 }: {
   counts: Record<string, number>;
   activeBucket: string;
   onBucket: (bucket: string) => void;
-  heads: Head[];
-  headValues: Record<string, number>;
-  onHeadValue: (head: string, value: number) => void;
+  views: SavedView[];
+  activeViewId: string | null;
+  onView: (view: SavedView) => void;
+  onSaveView: () => void;
+  onDeleteView: (id: string) => void;
   tags: Array<{ name: string; count: number }>;
   activeTag: string | null;
   onTag: (tag: string | null) => void;
   telemetry: Telemetry | null;
-  smart: SmartFilters;
-  onSmart: (next: SmartFilters) => void;
   onOpenJev: () => void;
+  status: CaptureStatus | 'all';
+  onStatus: (status: CaptureStatus | 'all') => void;
 }) {
   const dailyPct = telemetry ? Math.min(100, (telemetry.usageToday / Math.max(1, telemetry.caps.dailyCalls)) * 100) : 0;
   const ramPct = telemetry ? Math.min(100, (telemetry.rssMb / 400) * 100) : 0;
-  const filterHeads = heads.filter((head) => head.active && head.primitive !== 'choice').slice(0, 8);
-  const sublimatedCount = (telemetry?.survivalBuckets ?? []).reduce((sum, bucket) => sum + bucket.sublimated, 0);
 
   return (
     <aside className="flex w-[240px] shrink-0 flex-col overflow-y-auto border-r border-[var(--border)] bg-[#0c1013]">
@@ -76,45 +58,60 @@ export function LeftRail({
 
       <div className="border-t border-[var(--border)] p-3">
         <div className="flex items-center justify-between px-1">
-          <span className="text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Smart Filters</span>
-          <button type="button" onClick={() => onSmart({})} title="Reset filters" className="text-[var(--muted)] hover:text-[var(--text)]">
-            <RotateCcw size={11} />
+          <span className="text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Saved Views</span>
+          <button type="button" onClick={onSaveView} title="Save current query" className="text-[var(--muted)] hover:text-[var(--emerald)]">
+            <Plus size={12} />
           </button>
         </div>
         <div className="mt-1.5 space-y-0.5">
-          <Row label="Paradoxes ⚔️" count={smart.paradoxOnly ? (counts.all ?? 0) : 0} active={!!smart.paradoxOnly} onClick={() => onSmart({ ...smart, paradoxOnly: !smart.paradoxOnly })} />
-          <Row label="Resonant ×2+" count={smart.minResonance ? (counts.all ?? 0) : 0} active={smart.minResonance === 2} onClick={() => onSmart({ ...smart, minResonance: smart.minResonance === 2 ? undefined : 2 })} />
-          <Row label="Decaying" count={smart.decaying ? (counts.all ?? 0) : 0} active={!!smart.decaying} onClick={() => onSmart({ ...smart, decaying: !smart.decaying })} />
-          <Row label="Sublimated" count={sublimatedCount} active={!!smart.sublimated} onClick={() => onSmart({ ...smart, sublimated: !smart.sublimated })} />
+          {views.map((view) => (
+            <div key={view.id} className="group flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => onView(view)}
+                className={cn(
+                  'flex min-w-0 flex-1 items-center gap-2 rounded px-2 py-1.5 text-left text-[11.5px]',
+                  activeViewId === view.id
+                    ? 'bg-[var(--surface-hover)] text-[var(--text)]'
+                    : 'text-[var(--hint)] hover:bg-[var(--surface)] hover:text-[var(--text)]',
+                )}
+                title={view.query}
+              >
+                <Save size={11} className="shrink-0 text-[var(--muted)]" />
+                <span className="min-w-0 flex-1 truncate">{view.name}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onDeleteView(view.id)}
+                title="Delete view"
+                className="rounded p-1 text-[var(--muted)] opacity-0 transition hover:text-[var(--rose)] group-hover:opacity-100"
+              >
+                <Trash2 size={11} />
+              </button>
+            </div>
+          ))}
+          {views.length === 0 ? <p className="px-1 text-[11px] text-[var(--muted)]">No saved views.</p> : null}
         </div>
       </div>
 
       <div className="border-t border-[var(--border)] p-3">
-        <div className="px-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Jev Probability</div>
-        <div className="mt-2 space-y-3">
-          {filterHeads.length === 0 ? <p className="px-1 text-[11px] text-[var(--muted)]">No active score/noul heads.</p> : null}
-          {filterHeads.map((head) => {
-            const max = head.primitive === 'noul' ? 1 : (head.config.max ?? 3);
-            const step = head.primitive === 'noul' ? 0.05 : 0.1;
-            const value = headValues[head.name] ?? 0;
-            return (
-              <label key={head.id} className="block px-1">
-                <span className="flex items-center justify-between text-[10.5px] text-[var(--hint)]">
-                  <span>{head.name}</span>
-                  <span className="mono text-[var(--emerald)]">{value.toFixed(head.primitive === 'noul' ? 2 : 1)}+</span>
-                </span>
-                <input
-                  type="range"
-                  min={0}
-                  max={max}
-                  step={step}
-                  value={value}
-                  onChange={(event) => onHeadValue(head.name, Number(event.target.value))}
-                  className="mt-1 h-1 w-full cursor-pointer appearance-none rounded bg-[var(--surface-hover)] accent-[var(--emerald)]"
-                />
-              </label>
-            );
-          })}
+        <div className="px-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Status</div>
+        <div className="mt-1.5 grid grid-cols-4 gap-1">
+          {(['active', 'resolved', 'archived', 'all'] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => onStatus(value)}
+              className={cn(
+                'rounded border px-1 py-1 text-[9.5px] capitalize',
+                status === value
+                  ? 'border-[var(--emerald)] bg-[var(--emerald-soft)] text-[var(--emerald)]'
+                  : 'border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)]',
+              )}
+            >
+              {value}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -123,7 +120,7 @@ export function LeftRail({
           <Hash size={11} /> Tags
         </div>
         <div className="mt-1.5 flex flex-wrap gap-1">
-          {tags.slice(0, 24).map((tag) => (
+          {tags.slice(0, 30).map((tag) => (
             <button
               key={tag.name}
               type="button"
@@ -147,14 +144,14 @@ export function LeftRail({
           <Activity size={11} /> Engine Health
         </div>
         <div className="mono mt-2 space-y-1.5 text-[10.5px] text-[var(--hint)]">
-          <div className="flex justify-between"><span>Jev today</span><span className="text-[var(--text)]">{telemetry?.usageToday ?? 0}/{telemetry?.caps.dailyCalls ?? 30} · ${(telemetry?.usageTodayUsd ?? 0).toFixed(4)}</span></div>
+          <div className="flex justify-between"><span>Today</span><span className="text-[var(--text)]">{telemetry?.usageToday ?? 0}/{telemetry?.caps.dailyCalls ?? 30} · ${(telemetry?.usageTodayUsd ?? 0).toFixed(4)}</span></div>
           <div className="h-1 overflow-hidden rounded bg-[var(--surface-hover)]"><div className="h-full bg-[var(--amber)]" style={{ width: `${dailyPct}%` }} /></div>
-          <div className="flex justify-between"><span>Local hit</span><span className="text-[var(--emerald)]">{Math.round((telemetry?.localHitRate ?? 0) * 100)}%</span></div>
-          <div className="flex justify-between"><span>RAM</span><span className={ramPct > 80 ? 'text-[var(--rose)]' : 'text-[var(--text)]'}>{telemetry?.rssMb ?? 0} / 400 MB</span></div>
+          <div className="flex justify-between"><span>Month USD</span><span className="text-[var(--text)]">${(telemetry?.usageMonthUsd ?? 0).toFixed(4)}</span></div>
+          <div className="flex justify-between"><span>RAM RSS</span><span className={ramPct > 80 ? 'text-[var(--rose)]' : 'text-[var(--text)]'}>{telemetry?.rssMb ?? 0} MB</span></div>
           <div className="h-1 overflow-hidden rounded bg-[var(--surface-hover)]"><div className={cn('h-full', ramPct > 80 ? 'bg-[var(--rose)]' : 'bg-[var(--emerald)]')} style={{ width: `${ramPct}%` }} /></div>
           <div className="flex items-center justify-between pt-0.5">
-            <span className="flex items-center gap-1"><Cpu size={10} /> {telemetry?.vectorCount ?? 0} vectors</span>
-            <span className="flex items-center gap-1 text-[var(--amber)]"><Sparkles size={10} /> {telemetry?.jevMode ?? 'gated'}</span>
+            <span className="flex items-center gap-1"><Cpu size={10} /> {telemetry?.totalCaptures ?? 0} captures</span>
+            <span className="rounded border border-[var(--border)] px-1 text-[var(--amber)]">{telemetry?.jevMode ?? 'auto'}</span>
           </div>
         </div>
       </button>

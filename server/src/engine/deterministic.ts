@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import * as chrono from 'chrono-node';
@@ -8,7 +7,7 @@ import type { Bucket } from '../db/queries.js';
 import { config } from '../config.js';
 
 const HASHTAG_PATTERN = /(?:^|\s)#([a-zA-Z0-9_-]{1,50})/g;
-const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
+const URL_PATTERN = /https?:\/\/[^\s<>"']+/iu;
 
 export interface DeterministicResult {
   text: string;
@@ -16,9 +15,11 @@ export interface DeterministicResult {
   bucketHint: Bucket | null;
   parsedDueAt: number | null;
   url: string | null;
+  sourceUrl: string | null;
+  urlTitle: string | null;
+  urlExcerpt: string | null;
   meta: Record<string, unknown>;
-  simhash: string;
-  features: number[];
+  manualBypass: boolean;
 }
 
 export function extractHashtags(content: string): string[] {
@@ -31,20 +32,42 @@ export function extractHashtags(content: string): string[] {
 }
 
 export function extractUrls(content: string): string[] {
-  return [...new Set([...content.matchAll(URL_PATTERN)].map((match) => match[0]).filter(Boolean))];
+  const found = new Set<string>();
+  for (const match of content.matchAll(new RegExp(URL_PATTERN, 'gi'))) {
+    if (match[0]) found.add(match[0]);
+  }
+  return [...found];
 }
 
-export function stripPrefixHint(content: string): { text: string; bucketHint: Bucket | null } {
-  const trimmed = content.trimStart();
-  const prefixes: Array<{ pattern: RegExp; bucket: Bucket }> = [
-    { pattern: /^(?:!rem|remind)\s+/i, bucket: 'reminder' },
-    { pattern: /^mem:\s*/i, bucket: 'memory' },
-    { pattern: /^idea:\s*/i, bucket: 'idea' },
-  ];
-  for (const { pattern, bucket } of prefixes) {
-    if (pattern.test(trimmed)) return { text: trimmed.replace(pattern, '').trim(), bucketHint: bucket };
+export function stripPrefixHint(content: string): {
+  text: string;
+  bucketHint: Bucket | null;
+  manualBypass: boolean;
+} {
+  let text = content.trim();
+  let manualBypass = false;
+  let bucketHint: Bucket | null = null;
+
+  if (/^!(?:m|raw)\s+/iu.test(text)) {
+    manualBypass = true;
+    text = text.replace(/^!(?:m|raw)\s+/iu, '');
   }
-  return { text: content.trim(), bucketHint: null };
+
+  const prefixes: Array<{ pattern: RegExp; bucket: Bucket }> = [
+    { pattern: /^(?:!rem|remind)\s+/iu, bucket: 'reminder' },
+    { pattern: /^mem:\s*/iu, bucket: 'memory' },
+    { pattern: /^idea:\s*/iu, bucket: 'idea' },
+    { pattern: /^q:\s*/iu, bucket: 'question' },
+    { pattern: /^ref:\s*/iu, bucket: 'reference' },
+  ];
+  for (const prefix of prefixes) {
+    if (prefix.pattern.test(text)) {
+      bucketHint = prefix.bucket;
+      text = text.replace(prefix.pattern, '');
+      break;
+    }
+  }
+  return { text: text.trim(), bucketHint, manualBypass };
 }
 
 function timezoneOffset(timeZone: string, date: Date): string {
@@ -159,61 +182,29 @@ export async function fetchReadable(rawUrl: string): Promise<{ url: string; titl
   }
 }
 
-export function simhash(text: string): string {
-  const normalized = ` ${text.toLowerCase().replace(/\s+/g, ' ').trim()} `;
-  const grams: string[] = [];
-  for (let i = 0; i < normalized.length - 2; i += 1) grams.push(normalized.slice(i, i + 3));
-  const bits = new Uint32Array(64);
-  for (const gram of grams) {
-    const digest = createHash('sha256').update(gram).digest();
-    for (let bit = 0; bit < 64; bit += 1) {
-      const byte = digest[bit >> 3] ?? 0;
-      const value = (byte >> (bit & 7)) & 1;
-      bits[bit] = (bits[bit] ?? 0) + (value ? 1 : -1);
-    }
-  }
-  let out = 0n;
-  for (let bit = 0; bit < 64; bit += 1) {
-    if ((bits[bit] ?? 0) > 0) out |= 1n << BigInt(bit);
-  }
-  return out.toString(16).padStart(16, '0');
-}
-
-const IMPERATIVE = /\b(do|make|build|send|call|buy|fix|write|review|check|email|schedule|remember to|don't forget)\b/i;
-
-/** 12 lexical features for the Layer-1 probe. */
-export function lexicalFeatures(text: string, parsedDueAt: number | null): number[] {
-  const words = text.trim().split(/\s+/).filter(Boolean);
-  const charLength = Math.min(text.length / 500, 1);
-  const wordCount = Math.min(words.length / 100, 1);
-  const uppercase = text.replace(/[^A-Z]/g, '').length / Math.max(text.length, 1);
-  return [
-    charLength,
-    wordCount,
-    text.includes('?') ? 1 : 0,
-    URL_PATTERN.test(text) ? 1 : 0,
-    parsedDueAt ? 1 : 0,
-    text.includes('`') ? 1 : 0,
-    /\d/.test(text) ? 1 : 0,
-    uppercase,
-    (text.match(/^\s*[-*•]\s+/gm) ?? []).length / 20,
-    (text.match(HASHTAG_PATTERN) ?? []).length / 5,
-    IMPERATIVE.test(text) ? 1 : 0,
-    Math.min((text.match(/!/g) ?? []).length / 5, 1),
-  ];
-}
-
-export async function runDeterministic(content: string, now = new Date()): Promise<DeterministicResult> {
-  const { text, bucketHint } = stripPrefixHint(content);
+export async function runDeterministic(
+  content: string,
+  now = new Date(),
+  skipUrlFetch = false,
+): Promise<DeterministicResult> {
+  const { text, bucketHint, manualBypass } = stripPrefixHint(content);
   const tags = extractHashtags(text);
   const parsedDueAt = parseDueAt(text, now);
   const urls = extractUrls(text);
-  const meta: Record<string, unknown> = {};
   const url = urls[0] ?? null;
-  const primarilyUrl = url !== null && text.replace(url, '').trim().length < 80;
-  if (url && primarilyUrl) {
-    const readable = await fetchReadable(url);
-    if (readable) meta.url = readable;
+  let sourceUrl: string | null = null;
+  let urlTitle: string | null = null;
+  let urlExcerpt: string | null = null;
+  if (url) {
+    sourceUrl = url;
+    if (!skipUrlFetch) {
+      const readable = await fetchReadable(url);
+      if (readable) {
+        sourceUrl = readable.url;
+        urlTitle = readable.title || null;
+        urlExcerpt = readable.excerpt || null;
+      }
+    }
   }
   return {
     text,
@@ -221,8 +212,10 @@ export async function runDeterministic(content: string, now = new Date()): Promi
     bucketHint,
     parsedDueAt,
     url,
-    meta,
-    simhash: simhash(text),
-    features: lexicalFeatures(text, parsedDueAt),
+    sourceUrl,
+    urlTitle,
+    urlExcerpt,
+    meta: {},
+    manualBypass,
   };
 }
