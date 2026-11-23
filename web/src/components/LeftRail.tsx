@@ -50,6 +50,7 @@ export function LeftRail({
   const dailyPct = telemetry ? Math.min(100, (telemetry.usageToday / Math.max(1, telemetry.caps.dailyCalls)) * 100) : 0;
   const ramPct = telemetry ? Math.min(100, (telemetry.rssMb / 400) * 100) : 0;
   const filterHeads = heads.filter((head) => head.active && head.primitive !== 'choice').slice(0, 8);
+  const sublimatedCount = (telemetry?.survivalBuckets ?? []).reduce((sum, bucket) => sum + bucket.sublimated, 0);
 
   return (
     <aside className="flex w-[240px] shrink-0 flex-col overflow-y-auto border-r border-[var(--border)] bg-[#0c1013]">
@@ -81,10 +82,10 @@ export function LeftRail({
           </button>
         </div>
         <div className="mt-1.5 space-y-0.5">
-          <Row label="Paradoxes ⚔️" count={0} active={!!smart.paradoxOnly} onClick={() => onSmart({ ...smart, paradoxOnly: !smart.paradoxOnly })} />
-          <Row label="Resonant ×2+" count={0} active={smart.minResonance === 2} onClick={() => onSmart({ ...smart, minResonance: smart.minResonance === 2 ? undefined : 2 })} />
-          <Row label="Decaying" count={0} active={!!smart.decaying} onClick={() => onSmart({ ...smart, decaying: !smart.decaying })} />
-          <Row label="Sublimated" count={0} active={!!smart.sublimated} onClick={() => onSmart({ ...smart, sublimated: !smart.sublimated })} />
+          <Row label="Paradoxes ⚔️" count={smart.paradoxOnly ? (counts.all ?? 0) : 0} active={!!smart.paradoxOnly} onClick={() => onSmart({ ...smart, paradoxOnly: !smart.paradoxOnly })} />
+          <Row label="Resonant ×2+" count={smart.minResonance ? (counts.all ?? 0) : 0} active={smart.minResonance === 2} onClick={() => onSmart({ ...smart, minResonance: smart.minResonance === 2 ? undefined : 2 })} />
+          <Row label="Decaying" count={smart.decaying ? (counts.all ?? 0) : 0} active={!!smart.decaying} onClick={() => onSmart({ ...smart, decaying: !smart.decaying })} />
+          <Row label="Sublimated" count={sublimatedCount} active={!!smart.sublimated} onClick={() => onSmart({ ...smart, sublimated: !smart.sublimated })} />
         </div>
       </div>
 
