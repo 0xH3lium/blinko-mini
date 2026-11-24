@@ -5,214 +5,225 @@ process.env.BOT_TOKEN = '123456:TEST';
 process.env.OWNER_TELEGRAM_ID = '777777';
 process.env.DB_PATH = ':memory:';
 process.env.OWNER_TIMEZONE = 'Asia/Tehran';
-process.env.OPENROUTER_API_KEY = 'test-key';
-process.env.JEV_MODEL = 'typesafe/jev-1.14';
-process.env.JEV_DAILY_CALL_CAP = '2';
-process.env.JEV_DAILY_USD_CAP = '1';
-process.env.JEV_MONTHLY_USD_CAP = '10';
 
 const { createDatabase } = await import('../src/db/client.js');
-const { parseDueAt, stripPrefixHint, extractHashtags, assertSafeUrl } = await import('../src/engine/deterministic.js');
-const { getHeadRow, getReminder, listHeads, recordJevUsage, setSetting } = await import('../src/db/queries.js');
-const { canSpendJev, evaluateHeads } = await import('../src/engine/jev.js');
-const { createCaptureManual, ingestCaptureAuto } = await import('../src/engine/pipeline.js');
+const {
+  getCapture, getCaptureDetail, getField, getReminder, listCaptures, listRules, setCaptureTags,
+  syncCaptureFts, upsertFieldValue, upsertReminder, getSetting, setSetting,
+} = await import('../src/db/queries.js');
+const { runDeterministic, extractHashtags, assertSafeUrl, fetchReadable, nextDueAt, tomorrowAt } = await import('../src/engine/deterministic.js');
+const { evaluateRules, executeRuleSweep, previewRuleSweep } = await import('../src/engine/rules.js');
+const { ingestCaptureAuto, ingestBatch, createCaptureManual, mergeCaptures, reextractEdited } = await import('../src/engine/pipeline.js');
+const { findRelatedCaptures, findDuplicates } = await import('../src/engine/similarity.js');
+const { compileExtraction } = await import('../src/engine/extractor.js');
+const { parsePatch, previewPatch, applyPatch } = await import('../src/engine/patcher.js');
+const { ttlSweep, runTrashPurge } = await import('../src/engine/scheduler.js');
+const { initCapturesService } = await import('../src/services/captures.service.js');
 
-function mockJev(answersFor: (questions: Record<string, { type: string }>) => Record<string, unknown>) {
-  const calls: Array<{ body: Record<string, unknown> }> = [];
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-    calls.push({ body });
-    return new Response(
-      JSON.stringify({
-        model: 'typesafe/jev-1.14-2026-01',
-        answers: answersFor((body.questions ?? {}) as Record<string, { type: string }>),
-        usage: { input_tokens: 1000, output_tokens: 20, cost: 0.001 },
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    );
-  }) as typeof fetch;
-  return { calls, restore: () => { globalThis.fetch = original; } };
-}
-
-function standardAnswers(questions: Record<string, { type: string }>): Record<string, unknown> {
-  const answers: Record<string, unknown> = {};
-  for (const [key, question] of Object.entries(questions)) {
-    if (question.type === 'choice') {
-      answers[key] = {
-        type: 'choice',
-        choice: 'idea',
-        confidence: 0.9,
-        probabilities: { idea: 0.9, memory: 0.04, reminder: 0.02, question: 0.02, reference: 0.01, noise: 0.01 },
-      };
-    } else if (question.type === 'score') {
-      answers[key] = { type: 'score', score: 2, confidence: 0.8, legend: {}, probabilities: { 0: 0.05, 1: 0.1, 2: 0.75, 3: 0.1 } };
-    } else {
-      answers[key] = { type: 'noul', noul: 0.82 };
-    }
-  }
-  return answers;
-}
-
-test('chrono parsing is anchored to Asia/Tehran and prefers future dates', () => {
-  const now = new Date('2026-03-10T06:00:00Z');
-  const due = parseDueAt('tomorrow at 9am', now);
-  assert.ok(due);
-  const formatted = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit' }).format(new Date(due!));
-  assert.equal(formatted, '09:00');
-  assert.equal(parseDueAt('no date here at all', now), null);
-});
-
-test('all deterministic prefixes remove themselves and set the right hints', () => {
-  assert.deepEqual(stripPrefixHint('!m idea: raw manual capture'), { text: 'raw manual capture', bucketHint: 'idea', manualBypass: true });
-  assert.deepEqual(stripPrefixHint('!raw ref: something'), { text: 'something', bucketHint: 'reference', manualBypass: true });
-  assert.deepEqual(stripPrefixHint('!rem call the dentist'), { text: 'call the dentist', bucketHint: 'reminder', manualBypass: false });
-  assert.deepEqual(stripPrefixHint('remind call the dentist'), { text: 'call the dentist', bucketHint: 'reminder', manualBypass: false });
-  assert.deepEqual(stripPrefixHint('mem: keep this'), { text: 'keep this', bucketHint: 'memory', manualBypass: false });
-  assert.deepEqual(stripPrefixHint('idea: spark'), { text: 'spark', bucketHint: 'idea', manualBypass: false });
-  assert.deepEqual(stripPrefixHint('q: why?'), { text: 'why?', bucketHint: 'question', manualBypass: false });
-  assert.deepEqual(stripPrefixHint('ref: https://example.com'), { text: 'https://example.com', bucketHint: 'reference', manualBypass: false });
-  assert.deepEqual(extractHashtags('try #JEV and #jev #idea_2'), ['jev', 'idea_2']);
-});
-
-test('SSRF guard rejects localhost, private ranges and non-http protocols', async () => {
-  for (const url of [
-    'http://localhost/admin', 'http://127.0.0.1/', 'http://10.1.2.3/', 'http://172.20.0.1/',
-    'http://192.168.1.1/', 'http://169.254.169.254/latest', 'http://[::1]/', 'file:///etc/passwd',
-  ]) {
-    await assert.rejects(() => assertSafeUrl(url), undefined, url);
-  }
-  assert.equal((await assertSafeUrl('https://1.1.1.1/path')).hostname, '1.1.1.1');
-});
-
-test('Jev batches rich state, records the exact model, and retries retryable failures', async () => {
+test('inline micro-syntax parses bucket, fields, TTL, recurrence, pin, append and link', async () => {
   const db = createDatabase(':memory:');
-  setSetting(db, 'jev_mode', 'auto');
-  const original = globalThis.fetch;
-  let calls = 0;
-  let sentBody: Record<string, unknown> = {};
-  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
-    calls += 1;
-    sentBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-    if (calls === 1) return new Response('rate limited', { status: 429, headers: { 'retry-after': '0' } });
-    return new Response(JSON.stringify({ model: 'typesafe/jev-1.14-abc', answers: standardAnswers(sentBody.questions as Record<string, { type: string }>), usage: { input_tokens: 500, output_tokens: 12, cost: 0.0007 } }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as typeof fetch;
-  try {
-    const heads = listHeads(db, true).map((head) => getHeadRow(db, head.id)!);
-    const result = await evaluateHeads(db, {
-      content: 'A structured mechanism',
-      tags: ['fts', 'search'],
-      url: { url: 'https://example.com/post', title: 'Post', excerpt: 'Excerpt' },
-      parentCapture: { bucket: 'question', content: 'Parent question' },
-    }, heads, 'manual');
-    assert.equal(calls, 2);
-    assert.ok(result);
-    assert.equal(result!.modelVersion, 'typesafe/jev-1.14-abc');
-    assert.equal(result!.predictions.length, heads.length);
-    assert.ok(result!.predictions.every((prediction) => prediction.modelVersion === 'typesafe/jev-1.14-abc'));
-    const state = sentBody.state as { content: string; tags: string[]; url?: { url: string }; parentCapture?: { bucket: string } };
-    assert.equal(state.content, 'A structured mechanism');
-    assert.deepEqual(state.tags, ['fts', 'search']);
-    assert.equal(state.url?.url, 'https://example.com/post');
-    assert.equal(state.parentCapture?.bucket, 'question');
-    assert.equal(sentBody.model, 'typesafe/jev-1.14');
-    const usage = db.prepare('SELECT model_version, cost_usd FROM jev_usage').get() as { model_version: string; cost_usd: number };
-    assert.equal(usage.model_version, 'typesafe/jev-1.14-abc');
-    assert.equal(usage.cost_usd, 0.0007);
-  } finally {
-    globalThis.fetch = original;
-    db.close();
-  }
-});
+  const result = await runDeterministic('i: Solve chapter 1 #reservoir !L3 !act @domain:infra !pin !ttl 15m !every day 8am', new Date(), { db, skipUrlFetch: true });
+  assert.equal(result.bucketHint, 'idea');
+  assert.deepEqual(result.tags, ['reservoir']);
+  assert.equal(result.fields.leverage?.valueNum, 3);
+  assert.equal(result.fields.actionable?.valueText, 'yes');
+  assert.equal(result.fields.domain?.valueText, 'infra');
+  assert.equal(result.isPinned, true);
+  assert.ok(result.expiresAt && result.expiresAt > Date.now());
+  assert.equal(result.recurrence, 'daily@08:00');
+  assert.ok(result.parsedDueAt && result.parsedDueAt > Date.now());
+  assert.match(result.text, /Solve chapter 1/);
+  assert.doesNotMatch(result.text, /!L3|!ttl|!every|!pin|@domain/);
 
-test('budget firewall stops Jev when off or when the daily call cap is reached', () => {
-  const db = createDatabase(':memory:');
-  setSetting(db, 'jev_mode', 'off');
-  assert.equal(canSpendJev(db).ok, false);
-  setSetting(db, 'jev_mode', 'auto');
-  recordJevUsage(db, { triggerReason: 'manual', modelVersion: 'm', heads: ['bucket'], inputTokens: 1, outputTokens: 1, costUsd: 0, latencyMs: 1 });
-  recordJevUsage(db, { triggerReason: 'manual', modelVersion: 'm', heads: ['bucket'], inputTokens: 1, outputTokens: 1, costUsd: 0, latencyMs: 1 });
-  const gate = canSpendJev(db);
-  assert.equal(gate.ok, false);
-  assert.match(gate.reason ?? '', /cap/);
+  const append = await runDeterministic('++ extra detail', new Date(), { db, skipUrlFetch: true });
+  assert.equal(append.appendToLast, true);
+  const link = await runDeterministic('^ connected note', new Date(), { db, skipUrlFetch: true });
+  assert.equal(link.linkToLast, true);
+  assert.deepEqual(extractHashtags('note #انرژی and #work_2'), ['انرژی', 'work_2']);
+  const weekly = nextDueAt('weekly:mon,thu@09:00', Date.now());
+  assert.ok(weekly && weekly > Date.now());
+  const tomorrow = tomorrowAt(9, 0, new Date('2026-01-01T12:00:00Z'), 'Asia/Tehran');
+  const hour = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Tehran', hour: '2-digit', hourCycle: 'h23' }).format(new Date(tomorrow));
+  assert.equal(hour, '09');
   db.close();
 });
 
-test('createCaptureManual persists every field with zero fetch calls', async () => {
-  const db = createDatabase(':memory:');
+test('SSRF guard blocks a 302 redirect to localhost', async () => {
+  await assert.rejects(() => assertSafeUrl('http://127.0.0.1:3000/admin'));
+  await assert.rejects(() => assertSafeUrl('file:///etc/passwd'));
   const original = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = (async () => { fetchCalls += 1; throw new Error('manual mode must not fetch'); }) as typeof fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:3000/admin' } });
+  }) as typeof fetch;
   try {
-    const parent = await createCaptureManual(db, {
-      content: 'parent capture', bucket: 'question', status: 'active', isPinned: false, tags: [],
-      reminderDueAt: null, decisions: {}, links: [],
-    });
-    const createdAt = Date.parse('2026-01-02T03:04:05Z');
-    const result = await createCaptureManual(db, {
-      content: '#manual capture with **markdown**',
-      bucket: 'memory',
-      status: 'archived',
-      isPinned: true,
-      tags: ['manual', 'deep-work'],
-      sourceUrl: 'https://example.com/article',
-      urlTitle: 'Article title',
-      urlExcerpt: 'Article excerpt',
-      meta: { source: 'test' },
-      createdAt,
-      reminderDueAt: createdAt + 60_000,
-      reminderState: 'notified',
-      snoozeCount: 2,
-      decisions: {
-        leverage: { valueNum: 3 },
-        actionable: { valueText: 'no', valueNum: 0 },
-      },
-      links: [{ targetId: parent.capture!.id, relation: 'refines', note: 'manual link' }],
-    });
-    assert.equal(fetchCalls, 0);
-    assert.equal(result.jevUsed, false);
-    const capture = result.capture!;
-    assert.equal(capture.captureMode, 'manual');
-    assert.equal(capture.bucket, 'memory');
-    assert.equal(capture.status, 'archived');
-    assert.equal(capture.isPinned, true);
-    assert.deepEqual(capture.tags, ['deep-work', 'manual']);
-    assert.equal(capture.urlTitle, 'Article title');
-    assert.equal(capture.createdAt, createdAt);
-    assert.deepEqual(capture.meta, { source: 'test' });
-    assert.equal(capture.decisions['leverage']?.source, 'human');
-    assert.equal(capture.decisions['leverage']?.valueNum, 3);
-    assert.equal(capture.decisions['bucket']?.valueText, 'memory');
-    assert.equal(capture.decisions['bucket']?.source, 'human');
-    assert.equal(getReminder(db, capture.id)?.state, 'notified');
-    assert.equal(capture.edgeCount, 1);
-  } finally {
-    globalThis.fetch = original;
-    db.close();
-  }
+    assert.equal(await fetchReadable('https://example.com/article'), null);
+    assert.equal(calls, 1, 'redirect target must be rejected before a second request');
+  } finally { globalThis.fetch = original; }
 });
 
-test('ingestCaptureAuto honours manual bypass and evaluates every active head in one call', async () => {
+test('rules evaluate in priority order, respect stopOnMatch and expand $1 / domain tags', () => {
   const db = createDatabase(':memory:');
-  setSetting(db, 'jev_mode', 'auto');
-  const bypass = await ingestCaptureAuto(db, { content: '!m idea: manual bypass #raw' });
-  assert.equal(bypass.jevUsed, false);
-  assert.equal(bypass.capture?.captureMode, 'manual');
-  assert.equal(bypass.capture?.bucket, 'idea');
-  assert.deepEqual(bypass.capture?.tags, ['raw']);
+  const rules = listRules(db);
+  const first = evaluateRules(rules, { content: 'Look at https://github.com/blinko/os', tags: [], bucket: 'idea', sourceUrl: 'https://github.com/blinko/os' });
+  assert.ok(first.matchedRules.some((match) => match.name === 'URL Reference Router'));
+  assert.ok(first.patch.addTags?.includes('github'));
+  assert.equal(first.patch.bucket, 'reference');
+  const captured = evaluateRules([{
+    ...rules[4]!, id: 'capture-rule', name: 'Capture group', priority: 1,
+    conditions: { regex: '^Replace (\\w+)', regexFlags: 'iu' }, actions: { addTags: ['$1'] },
+  }], { content: 'Replace reservoir with notes', tags: [], bucket: 'idea' });
+  assert.deepEqual(captured.patch.addTags, ['reservoir']);
 
-  const mock = mockJev(standardAnswers);
-  try {
-    const result = await ingestCaptureAuto(db, { content: 'idea: FTS5 is a deterministic mechanism #search', skipUrlFetch: true });
-    assert.equal(mock.calls.length, 1);
-    assert.equal(result.jevUsed, true);
-    assert.equal(result.capture?.captureMode, 'auto');
-    assert.equal(result.capture?.bucket, 'idea');
-    assert.equal(result.capture?.decisions['bucket']?.source, 'deterministic');
-    assert.equal(result.capture?.decisions['leverage']?.source, 'jev');
-    assert.equal(result.capture?.decisions['actionable']?.valueNum, 0.82);
-  } finally {
-    mock.restore();
-    db.close();
-  }
+  const stop = evaluateRules([
+    { ...rules[0]!, id: 'first', name: 'first', priority: 1, stopOnMatch: true, conditions: { keywords: ['anything'] }, actions: { setBucket: 'reference' } },
+    { ...rules[1]!, id: 'second', name: 'second', priority: 2, conditions: { keywords: ['anything'] }, actions: { setBucket: 'noise' } },
+  ], { content: 'anything', tags: [], bucket: 'idea' });
+  assert.deepEqual(stop.matchedRules.map((match) => match.id), ['first']);
+  assert.equal(stop.patch.bucket, 'reference');
+
+  const db2 = createDatabase(':memory:');
+  db2.prepare("INSERT INTO captures (id, content, created_at, updated_at) VALUES (?,?,?,?)").run('locked', 'Solve the task', 1, 1);
+  const leverage = getField(db2, 'leverage')!;
+  upsertFieldValue(db2, 'locked', leverage.id, { valueText: '0', valueNum: 0, source: 'human', locked: true });
+  syncCaptureFts(db2, 'locked');
+  db2.prepare('INSERT INTO rules (id, name, conditions_json, actions_json, priority, created_at, updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run('force-leverage', 'Force leverage', '{"keywords":["Solve"]}', JSON.stringify({ setFields: { leverage: { valueNum: 3, valueText: '3' } } }), 1, 1, 1);
+  assert.equal(previewRuleSweep(db2, undefined, '').affectedCount, 1);
+  executeRuleSweep(db2, undefined, '');
+  assert.equal(getCapture(db2, 'locked')?.fields.leverage?.valueNum, 0, 'human-locked fields must survive a sweep');
+  executeRuleSweep(db2, undefined, '', true);
+  assert.equal(getCapture(db2, 'locked')?.fields.leverage?.valueNum, 3, 'explicit overwrite may replace locked fields');
+  assert.ok((db2.prepare('SELECT hit_count FROM rules WHERE id = ?').get('force-leverage') as { hit_count: number }).hit_count >= 2);
+  db.close(); db2.close();
+});
+
+test('seeded OTP rule applies TTL, tags and markTriaged during ingestion', async () => {
+  const db = createDatabase(':memory:');
+  const result = await ingestCaptureAuto(db, { content: 'your OTP is 123456', skipUrlFetch: true });
+  const capture = getCapture(db, result.capture!.id);
+  assert.equal(capture?.bucket, 'noise');
+  assert.ok(capture?.tags.includes('ephemeral'));
+  assert.ok(capture?.expiresAt && capture.expiresAt > Date.now());
+  assert.equal(capture?.expireAction, 'trash');
+  assert.equal(capture?.triaged, true);
+  assert.ok(listCaptures(db, { q: 'has:ttl', status: 'all' }).captures.some((item) => item.id === capture!.id));
+  db.close();
+});
+
+test('batch ingestion, append/stitch merge, re-extraction and duplicate detection', async () => {
+  const db = createDatabase(':memory:');
+  const batch = await ingestBatch(db, 'first atomic note\n\nsecond atomic note\n\nthird atomic note');
+  assert.equal(batch.created, 3);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM captures').get() as { n: number }).n, 3);
+
+  const first = await ingestCaptureAuto(db, { content: 'i: Reservoir computing #reservoir', skipUrlFetch: true });
+  const second = await ingestCaptureAuto(db, { content: 'm: Same reservoir idea #reservoir', skipUrlFetch: true });
+  assert.ok(first.capture && second.capture);
+  db.prepare('INSERT INTO capture_edges (source_id, target_id, relation, created_at) VALUES (?,?,?,?)').run(first.capture.id, second.capture.id, 'related', Date.now());
+  const merged = mergeCaptures(db, { survivorId: first.capture.id, absorbIds: [second.capture.id], mergedContent: 'Reservoir computing, unified' });
+  assert.equal(merged?.content, 'Reservoir computing, unified');
+  assert.ok(merged?.tags.includes('reservoir'));
+  assert.equal((db.prepare('SELECT deleted_at FROM captures WHERE id = ?').get(second.capture.id) as { deleted_at: number }).deleted_at > 0, true);
+  const edges = getCaptureDetail(db, first.capture.id)?.edges ?? [];
+  assert.equal(edges.length, 0, 'self-loops from the merge must be removed');
+
+  const edited = await reextractEdited(db, first.capture.id, 'i: Updated reservoir #updated tomorrow 9am');
+  assert.equal(edited?.content, 'Updated reservoir #updated tomorrow 9am');
+  assert.ok(edited?.tags.includes('updated'));
+  assert.ok(edited?.reminder?.dueAt);
+
+  const dup = findDuplicates(db, 'Updated reservoir #updated tomorrow 9am');
+  assert.ok(dup.length > 0 && dup[0]!.capture.id === first.capture.id);
+  const related = findRelatedCaptures(db, first.capture.id);
+  assert.ok(Array.isArray(related));
+  db.close();
+});
+
+test('TTL expiration, soft trash restore and retention purge', async () => {
+  const db = createDatabase(':memory:');
+  const service = initCapturesService(db);
+  const now = Date.now();
+  const expiring = await createCaptureManual(db, {
+    content: 'expiring OTP', bucket: 'noise', status: 'active', isPinned: false, expiresAt: now - 1000,
+    expireAction: 'trash', reminderDueAt: null, fields: {}, links: [],
+  });
+  const archiving = await createCaptureManual(db, {
+    content: 'expiring scratch', bucket: 'idea', status: 'active', isPinned: false, expiresAt: now - 1000,
+    expireAction: 'archive', reminderDueAt: null, fields: {}, links: [],
+  });
+  assert.equal(ttlSweep(db), 2);
+  assert.ok(getCapture(db, expiring.capture!.id)?.deletedAt);
+  assert.equal(getCapture(db, archiving.capture!.id)?.status, 'archived');
+  assert.equal(service.restore(expiring.capture!.id), true);
+  assert.equal(getCapture(db, expiring.capture!.id)?.deletedAt, null);
+  assert.equal(service.remove(expiring.capture!.id), true);
+  assert.equal(service.restore(expiring.capture!.id), true);
+  db.prepare('UPDATE captures SET deleted_at = ? WHERE id = ?').run(now - 40 * 86_400_000, expiring.capture!.id);
+  assert.ok(runTrashPurge(db) >= 1);
+  assert.equal(getCapture(db, expiring.capture!.id), undefined);
+  db.close();
+});
+
+test('reminder actions reset notified state, count snoozes and schedule recurrence', () => {
+  const db = createDatabase(':memory:');
+  const service = initCapturesService(db);
+  const created = db.prepare('INSERT INTO captures (id, content, created_at, updated_at) VALUES (?,?,?,?)').run('rem1', 'reminder note', 1, 1);
+  assert.ok(created.changes);
+  upsertReminder(db, 'rem1', { dueAt: Date.now() - 1000, state: 'notified', snoozeCount: 1 });
+  service.reminderAction('rem1', 'snooze4');
+  assert.equal(getReminder(db, 'rem1')?.state, 'pending');
+  assert.equal(getReminder(db, 'rem1')?.snoozeCount, 2);
+  assert.ok(getReminder(db, 'rem1')!.dueAt > Date.now());
+  service.reminderAction('rem1', 'tomorrow');
+  assert.equal(getReminder(db, 'rem1')?.snoozeCount, 3);
+  upsertReminder(db, 'rem1', { dueAt: Date.now(), state: 'notified', recurrence: 'daily@08:00' });
+  service.reminderAction('rem1', 'done');
+  const next = getReminder(db, 'rem1');
+  assert.equal(next?.state, 'pending');
+  assert.equal(next?.snoozeCount, 0);
+  assert.ok(next!.dueAt > Date.now());
+  assert.equal(getCapture(db, 'rem1')?.status, 'active');
+  db.close();
+});
+
+
+test('extractor compilation and patch importer round trip', async () => {
+  const db = createDatabase(':memory:');
+  const a = await createCaptureManual(db, {
+    content: 'the **mechanism** of reservoir computing', bucket: 'idea', status: 'active', isPinned: false,
+    tags: ['reservoir'], reminderDueAt: null, fields: { leverage: { valueNum: 3 } }, links: [],
+  });
+  const b = await createCaptureManual(db, {
+    content: 'linked implementation detail', bucket: 'memory', status: 'active', isPinned: false,
+    tags: ['reservoir'], reminderDueAt: null, fields: {}, links: [{ targetId: a.capture!.id, relation: 'refines' }],
+  });
+  const compiled = compileExtraction(db, { captureIds: [b.capture!.id], includeNeighbors: true });
+  assert.equal(compiled.captureCount, 1);
+  assert.equal(compiled.neighborCount, 1);
+  assert.ok(compiled.text.includes(b.capture!.id));
+  assert.ok(compiled.text.includes('[LINKED CONTEXT]'));
+  assert.equal(compiled.estimatedTokens, Math.ceil(compiled.text.length / 4));
+
+  const raw = '```json\n' + JSON.stringify({
+    updates: [{ id: a.capture!.id, bucket: 'reference', addTags: ['verified'], fields: { actionable: true }, triaged: true }],
+    merges: [], newCaptures: [],
+  }) + '\n```';
+  const preview = previewPatch(db, raw);
+  assert.equal(preview.errors.length, 0);
+  assert.equal(preview.diffs.length, 1);
+  assert.equal(preview.diffs[0]?.after.bucket, 'reference');
+  const parsed = parsePatch(raw);
+  const result = applyPatch(db, parsed.patch);
+  assert.equal(result.affected, 1);
+  const updated = getCapture(db, a.capture!.id);
+  assert.equal(updated?.bucket, 'reference');
+  assert.ok(updated?.tags.includes('verified'));
+  assert.equal(updated?.fields.actionable?.source, 'patch');
+  assert.equal(updated?.triaged, true);
+  assert.equal((getSetting(db, 'inline_syntax_enabled', '')) === 'true', true);
+  setSetting(db, 'inline_syntax_enabled', 'false');
+  assert.equal(getSetting(db, 'inline_syntax_enabled', ''), 'false');
+  db.close();
 });

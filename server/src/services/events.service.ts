@@ -2,6 +2,8 @@ export type EventType =
   | 'capture.created'
   | 'capture.updated'
   | 'capture.deleted'
+  | 'capture.restored'
+  | 'capture.bulk'
   | 'edge.updated'
   | 'reminder.updated'
   | 'telemetry.updated'

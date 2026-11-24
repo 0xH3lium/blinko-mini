@@ -6,15 +6,11 @@ process.env.BOT_TOKEN = '123456:TEST';
 process.env.OWNER_TELEGRAM_ID = '777777';
 process.env.DB_PATH = ':memory:';
 process.env.DEV_AUTH_BYPASS = 'false';
-process.env.OPENROUTER_API_KEY = 'test-key';
-process.env.JEV_DAILY_CALL_CAP = '100';
-process.env.JEV_DAILY_USD_CAP = '10';
-process.env.JEV_MONTHLY_USD_CAP = '100';
 
 const { createApp } = await import('../src/app.js');
 const { getDatabase } = await import('../src/db/client.js');
 const { createLoginToken } = await import('../src/services/auth.service.js');
-const { setSetting } = await import('../src/db/queries.js');
+const { setSetting, getField } = await import('../src/db/queries.js');
 
 const app = createApp();
 const db = getDatabase();
@@ -24,22 +20,17 @@ function cookieFrom(response: Response): string {
 }
 
 async function login(): Promise<string> {
-  const loginToken = createLoginToken(db);
+  const token = createLoginToken(db);
   const response = await app.request('/auth/code', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: loginToken.code }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: token.code }),
   });
   assert.equal(response.status, 200);
-  const cookie = cookieFrom(response);
-  assert.ok(cookie.startsWith('blinko_session='));
-  return cookie;
+  return cookieFrom(response);
 }
 
 async function json(path: string, cookie: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: any }> {
   const response = await app.request(path, {
-    method: init.method ?? 'GET',
-    headers: { 'content-type': 'application/json', cookie },
+    method: init.method ?? 'GET', headers: { 'content-type': 'application/json', cookie },
     ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
   });
   let body: unknown = null;
@@ -47,230 +38,150 @@ async function json(path: string, cookie: string, init: { method?: string; body?
   return { status: response.status, body };
 }
 
-test('health is public and magic-link / 8-character code auth is HttpOnly', async () => {
+test('health is public and has zero Jev fields; magic link and 8-char code are HttpOnly', async () => {
   const health = await app.request('/api/health');
   assert.equal(health.status, 200);
-  const payload = (await health.json()) as { ok: boolean; jevMode: string; jevModel: string };
+  const payload = await health.json() as Record<string, unknown>;
   assert.equal(payload.ok, true);
-  assert.equal(payload.jevMode, 'auto');
-  assert.equal(payload.jevModel, 'typesafe/jev-1.14');
+  assert.equal(payload.jevMode, undefined);
+  assert.equal(payload.jevModel, undefined);
   assert.equal((await app.request('/api/captures')).status, 401);
 
-  const loginToken = createLoginToken(db);
-  assert.equal(loginToken.code.replace(/[^A-Z0-9]/g, '').length, 8);
-  const codeResponse = await app.request('/auth/code', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: loginToken.code.toLowerCase() }),
+  const token = createLoginToken(db);
+  assert.equal(token.code.replace(/[^A-Z0-9]/g, '').length, 8);
+  const response = await app.request('/auth/code', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: token.code.toLowerCase() }),
   });
-  assert.equal(codeResponse.status, 200);
-  assert.match((codeResponse.headers.get('set-cookie') ?? '').toLowerCase(), /httponly/);
+  assert.equal(response.status, 200);
+  assert.match((response.headers.get('set-cookie') ?? '').toLowerCase(), /httponly/);
   const reused = await app.request('/auth/code', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: loginToken.code }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: token.code }),
   });
   assert.equal(reused.status, 401);
-
   const magic = createLoginToken(db);
   const magicResponse = await app.request(`/auth/login?token=${magic.token}`);
   assert.equal(magicResponse.status, 302);
   assert.ok(magicResponse.headers.get('set-cookie'));
 });
 
-test('dual-mode capture, edit-anything patch, decisions, edges, bulk, views and export', async () => {
+test('capture CRUD, custom fields, soft trash, bulk actions, edges and unlimited export', async () => {
   const cookie = await login();
-  setSetting(db, 'jev_mode', 'off');
-
   const manual = await json('/api/captures', cookie, {
-    method: 'POST',
-    body: {
-      mode: 'manual',
-      content: 'manual **markdown** capture',
-      bucket: 'idea',
-      status: 'active',
-      isPinned: false,
-      tags: ['manual'],
-      sourceUrl: 'https://example.com/a',
-      urlTitle: 'A title',
-      urlExcerpt: 'An excerpt',
-      decisions: { leverage: { valueNum: 2 } },
+    method: 'POST', body: {
+      mode: 'manual', content: 'manual **markdown** #Work', bucket: 'idea', status: 'active',
+      isPinned: false, tags: ['manual'], triaged: true, fields: { leverage: { valueNum: 2 } },
     },
   });
   assert.equal(manual.status, 201);
-  assert.equal(manual.body.jevUsed, false);
-  assert.equal(manual.body.capture.captureMode, 'manual');
-  assert.equal(manual.body.capture.decisions.leverage.source, 'human');
-  const manualId = manual.body.capture.id as string;
+  assert.equal(manual.body.jevUsed, undefined);
+  assert.equal(manual.body.capture.triaged, true);
+  assert.equal(manual.body.capture.fields.leverage.source, 'human');
+  assert.equal(manual.body.capture.fields.leverage.locked, true);
+  const id = manual.body.capture.id as string;
 
-  const auto = await json('/api/captures', cookie, { method: 'POST', body: { content: 'auto capture with #fts' } });
+  const auto = await json('/api/captures', cookie, { method: 'POST', body: { content: 'i: deterministic #search !L3' } });
   assert.equal(auto.status, 201);
-  assert.equal(auto.body.capture.captureMode, 'auto');
-  assert.deepEqual(auto.body.capture.decisions, {});
-  const autoId = auto.body.capture.id as string;
+  assert.equal(auto.body.capture.bucket, 'idea');
+  assert.equal(auto.body.capture.content.includes('!L3'), false);
+  assert.equal(auto.body.capture.fields.leverage?.valueNum, 3);
+  assert.equal(auto.body.capture.triaged, false);
 
-  const search = await json(`/api/captures?q=${encodeURIComponent('b:idea #fts')}`, cookie);
-  assert.equal(search.status, 200);
-  assert.ok(search.body.captures.some((capture: { id: string }) => capture.id === autoId));
+  const search = await json(`/api/captures?q=${encodeURIComponent('b:idea #manual')}`, cookie);
+  assert.ok(search.body.captures.some((capture: { id: string }) => capture.id === id));
+  const searchUnicode = await json(`/api/captures?q=${encodeURIComponent('#Manual')}`, cookie);
+  assert.ok(searchUnicode.body.captures.some((capture: { id: string }) => capture.id === id));
 
-  const patched = await json(`/api/captures/${manualId}`, cookie, {
-    method: 'PATCH',
-    body: {
-      content: 'new content #should-not-resurrect',
-      bucket: 'reference',
-      status: 'archived',
-      isPinned: true,
-      tags: ['manual'],
-      reminder: { dueAt: Date.now() + 60_000, state: 'notified', snoozeCount: 3 },
-      decisions: { leverage: null, actionable: { valueText: 'yes', valueNum: 1 } },
-      meta: { edited: true },
-      createdAt: Date.parse('2026-02-02T00:00:00Z'),
+  const patched = await json(`/api/captures/${id}`, cookie, {
+    method: 'PATCH', body: {
+      bucket: 'reference', status: 'archived', isPinned: true, tags: ['manual', 'verified'],
+      fields: { actionable: { valueText: 'yes', valueNum: 1 }, leverage: null },
+      meta: { edited: true }, expiresAt: Date.now() + 60_000, expireAction: 'trash',
     },
   });
-  assert.equal(patched.status, 200);
   assert.equal(patched.body.bucket, 'reference');
-  assert.equal(patched.body.status, 'archived');
-  assert.equal(patched.body.isPinned, true);
-  assert.deepEqual(patched.body.tags, ['manual']);
-  assert.equal(patched.body.decisions.leverage, undefined);
-  assert.equal(patched.body.decisions.actionable.source, 'human');
-  assert.equal(patched.body.reminder.snoozeCount, 3);
-  assert.deepEqual(patched.body.meta, { edited: true });
+  assert.equal(patched.body.fields.leverage, undefined);
+  assert.equal(patched.body.fields.actionable.source, 'human');
+  assert.equal(patched.body.expiresAt !== null, true);
 
-  const parent = await json('/api/captures', cookie, {
-    method: 'POST', body: { mode: 'manual', content: 'edge parent', bucket: 'idea', status: 'active', isPinned: false, tags: [] },
+  const parent = await json('/api/captures', cookie, { method: 'POST', body: {
+    mode: 'manual', content: 'edge parent', bucket: 'idea', status: 'active', isPinned: false, tags: [],
+  } });
+  const edge = await json(`/api/captures/${id}/edges`, cookie, {
+    method: 'POST', body: { targetId: parent.body.capture.id, relation: 'refines', note: 'human link' },
   });
-  const parentId = parent.body.capture.id as string;
-  const edgeAdded = await json(`/api/captures/${manualId}/edges`, cookie, {
-    method: 'POST', body: { targetId: parentId, relation: 'refines', note: 'human link' },
-  });
-  assert.equal(edgeAdded.status, 201);
-  const detail = await json(`/api/captures/${manualId}`, cookie);
-  assert.equal(detail.body.edges.length, 1);
-  assert.equal(detail.body.edges[0].otherContent, 'edge parent');
-  assert.equal(detail.body.edges[0].direction, 'outgoing');
-  const edgeRemoved = await json(`/api/captures/${manualId}/edges`, cookie, {
-    method: 'DELETE', body: { targetId: parentId, relation: 'refines' },
-  });
-  assert.equal(edgeRemoved.status, 200);
-  assert.equal(edgeRemoved.body.edges.length, 0);
-
-  const cleared = await json('/api/captures', cookie, {
-    method: 'POST', body: { mode: 'manual', content: 'clear me', bucket: 'idea', status: 'active', isPinned: false, tags: [] },
-  });
-  const clearId = cleared.body.capture.id as string;
-  const removedDecision = await json(`/api/captures/${clearId}/decisions/head-bucket`, cookie, { method: 'DELETE' });
-  assert.equal(removedDecision.status, 200);
-  assert.equal(removedDecision.body.decisions.bucket, undefined);
+  assert.equal(edge.status, 201);
+  assert.equal((await json(`/api/captures/${id}`, cookie)).body.edges.length, 1);
+  await json(`/api/captures/${id}/edges`, cookie, { method: 'DELETE', body: { targetId: parent.body.capture.id, relation: 'refines' } });
 
   const bulk = await json('/api/captures/bulk', cookie, {
-    method: 'POST', body: { ids: [manualId, autoId], action: { type: 'addTags', value: ['bulk'] } },
+    method: 'POST', body: { ids: [id, auto.body.capture.id], action: { type: 'addTags', value: ['bulk'] } },
   });
-  assert.equal(bulk.status, 200);
   assert.equal(bulk.body.affected, 2);
+  const bulkField = await json('/api/captures/bulk', cookie, {
+    method: 'POST', body: { ids: [id], action: { type: 'setField', name: 'domain', value: 'infra' } },
+  });
+  assert.equal(bulkField.body.affected, 1);
 
   const view = await json('/api/views', cookie, { method: 'POST', body: { name: 'Test view', query: 'b:idea' } });
   assert.equal(view.status, 201);
-  const viewUpdate = await json(`/api/views/${view.body.id}`, cookie, { method: 'PATCH', body: { query: 'b:memory' } });
-  assert.equal(viewUpdate.body.query, 'b:memory');
+  assert.equal((await json(`/api/views/${view.body.id}`, cookie, { method: 'PATCH', body: { query: 'b:memory' } })).body.query, 'b:memory');
   assert.equal((await json(`/api/views/${view.body.id}`, cookie, { method: 'DELETE' })).status, 200);
 
-  const exportJson = await app.request('/api/export?format=json', { headers: { cookie } });
-  assert.equal(exportJson.status, 200);
-  assert.match(exportJson.headers.get('content-disposition') ?? '', /attachment/);
-  const exportBody = (await exportJson.json()) as { captures: unknown[]; tags: unknown[]; decisions: unknown[]; reminders: unknown[]; edges: unknown[] };
-  for (const key of ['captures', 'tags', 'decisions', 'reminders', 'edges']) assert.ok(Array.isArray(exportBody[key]));
-  const exportMd = await app.request('/api/export?format=md', { headers: { cookie } });
-  assert.match(await exportMd.text(), /BLINKO\/\/OS export/);
+  const trashed = await json(`/api/captures/${id}`, cookie, { method: 'DELETE' });
+  assert.equal(trashed.body.deleted, true);
+  assert.equal(trashed.body.permanent, false);
+  assert.equal((await json(`/api/captures/${id}`, cookie)).body.deletedAt !== null, true);
+  const trashView = await json('/api/captures?q=is:trash&status=all', cookie);
+  assert.ok(trashView.body.captures.some((capture: { id: string }) => capture.id === id));
+  assert.equal((await json(`/api/captures/${id}/restore`, cookie, { method: 'POST' })).status, 200);
+  assert.equal((await app.request(`/api/captures/${id}?permanent=true`, { method: 'DELETE', headers: { cookie } })).status, 200);
+  assert.equal((await json(`/api/captures/${id}`, cookie)).status, 404);
+
+  // Export must not be capped at 500 rows.
+  const now = Date.now();
+  const insert = db.prepare('INSERT INTO captures (id, content, created_at, updated_at) VALUES (?,?,?,?)');
+  for (let i = 0; i < 520; i += 1) insert.run(`bulk-${i}`, `export note ${i}`, now + i, now + i);
+  const exported = await app.request('/api/export?format=json', { headers: { cookie } });
+  assert.equal(exported.status, 200);
+  const payload = await exported.json() as { captures: unknown[]; fields: unknown[]; rules: unknown[] };
+  assert.ok(payload.captures.length >= 520, `expected full export, got ${payload.captures.length}`);
+  assert.ok(Array.isArray(payload.fields) && Array.isArray(payload.rules));
+  assert.match(await (await app.request('/api/export?format=md', { headers: { cookie } })).text(), /BLINKO\/\/OS export/);
+
+  const telemetry = await json('/api/telemetry', cookie);
+  assert.equal(telemetry.body.jevMode, undefined);
+  assert.ok(telemetry.body.activeCaptures > 500);
 });
 
-test('Jev re-evaluation syncs bucket and human override immediately clears the review queue', async () => {
+test('triage, reminder actions with recurrence, settings and SSE', async () => {
   const cookie = await login();
-  setSetting(db, 'jev_mode', 'auto');
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body ?? '{}')) as { questions?: Record<string, { type: string }> };
-    const answers: Record<string, unknown> = {};
-    for (const [key, question] of Object.entries(body.questions ?? {})) {
-      if (question.type === 'choice') {
-        answers[key] = {
-          type: 'choice', choice: 'question', confidence: 0.2,
-          probabilities: { idea: 0.2, memory: 0.2, reminder: 0.2, question: 0.2, reference: 0.1, noise: 0.1 },
-        };
-      } else if (question.type === 'score') {
-        answers[key] = { type: 'score', score: 1, confidence: 0.5, legend: {}, probabilities: { 0: 0.2, 1: 0.6, 2: 0.1, 3: 0.1 } };
-      } else {
-        answers[key] = { type: 'noul', noul: 0.5 };
-      }
-    }
-    return new Response(JSON.stringify({ model: 'typesafe/jev-1.14-test', answers, usage: { input_tokens: 10, output_tokens: 2, cost: 0.0001 } }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as typeof fetch;
-  try {
-    const created = await json('/api/captures', cookie, { method: 'POST', body: { content: 'uncertain routing probe' } });
-    assert.equal(created.status, 201);
-    const id = created.body.capture.id as string;
-    assert.equal(created.body.capture.bucket, 'question');
-    assert.equal(created.body.capture.decisions.bucket.source, 'jev');
+  const reminder = await json('/api/captures', cookie, { method: 'POST', body: {
+    mode: 'manual', content: 'recurring capture', bucket: 'reminder', status: 'active', isPinned: false,
+    tags: [], reminderDueAt: Date.now() - 1000, recurrence: 'daily@08:00',
+  } });
+  const id = reminder.body.capture.id as string;
+  assert.equal(reminder.body.capture.reminder.recurrence, 'daily@08:00');
+  assert.ok((await json('/api/triage', cookie)).body.untriaged !== undefined);
+  assert.ok((await json('/api/agenda', cookie)).body.overdue.some((item: { captureId: string }) => item.captureId === id));
 
-    const review = await json('/api/review', cookie);
-    const reviewItem = review.body.uncertain.find((item: { id: string }) => item.id === id);
-    assert.ok(reviewItem);
+  const notified = await json(`/api/captures/${id}`, cookie, { method: 'PATCH', body: {
+    reminder: { dueAt: Date.now() - 1000, state: 'notified' },
+  } });
+  assert.equal(notified.body.reminder.state, 'notified');
+  const snoozed = await json(`/api/captures/${id}/reminder/action`, cookie, { method: 'POST', body: { action: 'snooze4' } });
+  assert.equal(snoozed.body.reminder.state, 'pending');
+  assert.equal(snoozed.body.reminder.snoozeCount, 1);
+  const done = await json(`/api/captures/${id}/reminder/action`, cookie, { method: 'POST', body: { action: 'done' } });
+  assert.equal(done.body.reminder.state, 'pending');
+  assert.equal(done.body.reminder.snoozeCount, 0);
+  assert.ok(done.body.reminder.dueAt > Date.now());
 
-    const overrides = Object.fromEntries(
-      (reviewItem.reviewDecisions as Array<{ headId: string; valueText: string | null; valueNum: number | null }>).map((decision) => [
-        decision.headId,
-        { valueText: decision.headId === 'head-bucket' ? 'idea' : (decision.valueText ?? 'yes'), valueNum: decision.valueNum ?? 1 },
-      ]),
-    );
-    const override = await json(`/api/captures/${id}`, cookie, { method: 'PATCH', body: { decisions: overrides } });
-    assert.equal(override.status, 200);
-    assert.equal(override.body.bucket, 'idea');
-    assert.equal(override.body.decisions.bucket.source, 'human');
-    const after = await json('/api/review', cookie);
-    assert.equal(after.body.uncertain.some((item: { id: string }) => item.id === id), false);
-
-    const forced = await json(`/api/captures/${id}/jev`, cookie, { method: 'POST', body: { headIds: ['head-bucket'] } });
-    assert.equal(forced.status, 200);
-    assert.equal(forced.body.capture.bucket, 'question');
-  } finally {
-    globalThis.fetch = original;
-    setSetting(db, 'jev_mode', 'off');
-  }
-});
-
-test('agenda, head CRUD with full config, settings firewall and SSE stream', async () => {
-  const cookie = await login();
-  setSetting(db, 'jev_mode', 'off');
-
-  const reminder = await json('/api/captures', cookie, {
-    method: 'POST',
-    body: { mode: 'manual', content: 'overdue agenda item', bucket: 'reminder', status: 'active', isPinned: false, tags: [], reminderDueAt: Date.now() - 1000 },
-  });
-  assert.equal(reminder.status, 201);
-  const agenda = await json('/api/agenda', cookie);
-  assert.ok(agenda.body.overdue.some((item: { captureId: string }) => item.captureId === reminder.body.capture.id));
-
-  const choiceHead = await json('/api/heads', cookie, {
-    method: 'POST',
-    body: {
-      name: 'Priority', primitive: 'choice', instructions: 'Pick a priority',
-      config: { options: [{ value: 'low', description: 'low impact' }, { value: 'high', description: 'high impact' }] },
-      entropyThreshold: 0.4, sortOrder: 9, active: true,
-    },
-  });
-  assert.equal(choiceHead.status, 201);
-  assert.equal(choiceHead.body.config.options.length, 2);
-  const patchedHead = await json(`/api/heads/${choiceHead.body.id}`, cookie, {
-    method: 'PATCH',
-    body: { entropyThreshold: 0.7, config: { min: 0, max: 4, rubric: { 0: 'a', 1: 'b', 2: 'c', 3: 'd', 4: 'e' } }, primitive: 'score' },
-  });
-  assert.equal(patchedHead.body.primitive, 'score');
-  assert.equal(patchedHead.body.entropyThreshold, 0.7);
-  assert.equal(patchedHead.body.config.rubric['4'], 'e');
-  assert.equal((await json(`/api/heads/${choiceHead.body.id}`, cookie, { method: 'DELETE' })).status, 200);
-
-  const badSetting = await json('/api/settings', cookie, { method: 'PATCH', body: { jev_mode: 'gated' } });
+  const badSetting = await json('/api/settings', cookie, { method: 'PATCH', body: { burst_window_sec: { bad: true } } });
   assert.equal(badSetting.status, 400);
-  const goodSetting = await json('/api/settings', cookie, { method: 'PATCH', body: { jev_mode: 'off' } });
-  assert.equal(goodSetting.body.settings.jev_mode, 'off');
+  const settings = await json('/api/settings', cookie, { method: 'PATCH', body: { burst_window_sec: 240, digest_time: '08:30' } });
+  assert.equal(settings.body.settings.burst_window_sec, '240');
+  assert.equal(settings.body.settings.digest_time, '08:30');
+  setSetting(db, 'burst_window_sec', '180');
 
   const controller = new AbortController();
   const response = await app.request('/api/events', { headers: { cookie }, signal: controller.signal });
@@ -284,10 +195,66 @@ test('agenda, head CRUD with full config, settings firewall and SSE stream', asy
       if (done) break;
       buffer += new TextDecoder().decode(value, { stream: true });
     }
-  } finally {
-    clearTimeout(timeout);
-    controller.abort();
-    await reader.cancel().catch(() => undefined);
-  }
+  } finally { clearTimeout(timeout); controller.abort(); await reader.cancel().catch(() => undefined); }
   assert.ok(buffer.includes('event: connected'));
+});
+
+test('field, rule, extractor CRUD, simulator, sweeps, extractor compile and JSON patch round trip', async () => {
+  const cookie = await login();
+  const field = await json('/api/fields', cookie, { method: 'POST', body: {
+    name: 'effort', alias: 'ef', fieldType: 'score', config: { min: 0, max: 3, rubric: {} }, showInStream: true,
+  } });
+  assert.equal(field.status, 201);
+  assert.equal((await json(`/api/fields/${field.body.id}`, cookie, { method: 'PATCH', body: { alias: 'e' } })).body.alias, 'e');
+  assert.deepEqual((await json('/api/fields', cookie)).body.fields.map((item: { name: string }) => item.name).includes('effort'), true);
+
+  const rule = await json('/api/rules', cookie, { method: 'POST', body: {
+    name: 'Persian question', priority: 5, conditions: { regex: '^چرا', regexFlags: 'u' }, actions: { setBucket: 'question', addTags: ['پرسش'] },
+  } });
+  assert.equal(rule.status, 201);
+  const simulated = await json('/api/rules/test', cookie, { method: 'POST', body: { text: 'چرا اینگونه است؟' } });
+  assert.ok(simulated.body.matchedRules.some((match: { id: string }) => match.id === rule.body.id));
+  assert.equal(simulated.body.final.bucket, 'question');
+  const preview = await json('/api/rules/sweep/preview', cookie, { method: 'POST', body: { ruleId: rule.body.id, q: '' } });
+  assert.equal(typeof preview.body.affectedCount, 'number');
+  const sweep = await json('/api/rules/sweep/run', cookie, { method: 'POST', body: { ruleId: rule.body.id, q: '' } });
+  assert.equal(typeof sweep.body.affected, 'number');
+  assert.equal((await json(`/api/rules/${rule.body.id}`, cookie, { method: 'PATCH', body: { enabled: false } })).body.enabled, false);
+
+  const template = await json('/api/extractors', cookie, { method: 'POST', body: {
+    name: 'Test pack', slug: 'test-pack', preamble: 'count={{count}} fields={{fields_schema}}', itemTemplate: '[{{id}}] {{content}} {{tags}}',
+    outputMode: 'download_md', includeNeighbors: false,
+  } });
+  assert.equal(template.status, 201);
+  const source = await json('/api/captures', cookie, { method: 'POST', body: { content: 'extract me #tagged' } });
+  const compiled = await json('/api/extract', cookie, { method: 'POST', body: {
+    templateId: template.body.id, captureIds: [source.body.capture.id], includeNeighbors: false,
+  } });
+  assert.equal(compiled.body.captureCount, 1);
+  assert.ok(compiled.body.text.includes(`[${source.body.capture.id}]`));
+  assert.ok(compiled.body.estimatedTokens > 0);
+
+  const raw = JSON.stringify({ updates: [{ id: source.body.capture.id, bucket: 'reference', addTags: ['patched'], fields: { effort: 2 } }], merges: [], newCaptures: [] });
+  const patchPreview = await json('/api/patch/preview', cookie, { method: 'POST', body: { raw: `\`\`\`json\n${raw}\n\`\`\`` } });
+  assert.equal(patchPreview.body.errors.length, 0);
+  assert.equal(patchPreview.body.diffs[0].after.bucket, 'reference');
+  const applied = await json('/api/patch/apply', cookie, { method: 'POST', body: { raw } });
+  assert.equal(applied.body.affected, 1);
+  const final = await json(`/api/captures/${source.body.capture.id}`, cookie);
+  assert.equal(final.body.bucket, 'reference');
+  assert.ok(final.body.tags.includes('patched'));
+  assert.equal(final.body.fields.effort.source, 'patch');
+
+  const maintenance = await json('/api/system/maintenance', cookie, { method: 'POST', body: { action: 'rebuild_fts' } });
+  assert.ok(maintenance.body.rebuilt > 0);
+  const imported = await json('/api/import/json', cookie, { method: 'POST', body: {
+    captures: [{ id: source.body.capture.id, content: 'imported overwrite', bucket: 'idea', createdAt: Date.now() }], edges: [],
+  } });
+  assert.equal(imported.body.imported, 1);
+  assert.equal((await json(`/api/captures/${source.body.capture.id}`, cookie)).body.content, 'imported overwrite');
+
+  assert.equal((await json(`/api/extractors/${template.body.id}`, cookie, { method: 'DELETE' })).status, 200);
+  assert.equal((await json(`/api/rules/${rule.body.id}`, cookie, { method: 'DELETE' })).status, 200);
+  assert.equal((await json(`/api/fields/${field.body.id}`, cookie, { method: 'DELETE' })).status, 200);
+  assert.ok(getField(db, 'leverage'));
 });

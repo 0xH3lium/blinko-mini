@@ -13,7 +13,6 @@
   "dependencies": {
     "@hono/node-server": "^1.13.7",
     "@mozilla/readability": "^0.6.0",
-    "@typesafe-ai/sdk": "^0.7.0",
     "better-sqlite3": "^12.2.0",
     "chrono-node": "^2.10.3",
     "dotenv": "^16.4.7",

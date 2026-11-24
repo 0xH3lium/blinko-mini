@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowRight, Command, Download, Search, Sparkles, Wand2, Zap } from 'lucide-react';
+import { ArrowRight, Command, Download, FileInput, Layers, Search, Sparkles, Wand2, WandSparkles } from 'lucide-react';
 import { exportUrl, getCaptures } from '../api/client';
 import type { Capture, Mode } from '../types/capture';
 import { cn } from '../lib/utils';
 
 export function CommandPalette({
-  open, onClose, onSelect, onCaptureAuto, onCaptureManual, onMode, onToggleJev, onForceJev, selectedId,
+  open, onClose, onSelect, onCaptureAuto, onCaptureManual, onMode, onBatch, onExtract, onPatchImport, selectedId,
 }: {
   open: boolean;
   onClose: () => void;
@@ -13,8 +13,9 @@ export function CommandPalette({
   onCaptureAuto: () => void;
   onCaptureManual: () => void;
   onMode: (mode: Mode) => void;
-  onToggleJev: () => void;
-  onForceJev: (id: string) => void;
+  onBatch: () => void;
+  onExtract: () => void;
+  onPatchImport: () => void;
   selectedId: string | null;
 }) {
   const [query, setQuery] = useState('');
@@ -24,8 +25,7 @@ export function CommandPalette({
 
   useEffect(() => {
     if (!open) return;
-    setQuery('');
-    setResults([]);
+    setQuery(''); setResults([]);
     const timer = window.setTimeout(() => inputRef.current?.focus(), 20);
     return () => window.clearTimeout(timer);
   }, [open]);
@@ -51,23 +51,18 @@ export function CommandPalette({
   }, [open, query]);
 
   if (!open) return null;
-
   const actions: Array<{ label: string; hint: string; icon: React.ReactNode; run: () => void; disabled?: boolean }> = [
-    { label: 'New Capture (Auto)', hint: 'auto', icon: <Sparkles size={12} />, run: onCaptureAuto },
+    { label: 'New Capture (Quick Rules)', hint: 'auto', icon: <Sparkles size={12} />, run: onCaptureAuto },
     { label: 'New Capture (Manual)', hint: '⌘M', icon: <Wand2 size={12} />, run: onCaptureManual },
+    { label: 'Batch Paste', hint: 'atomic', icon: <Layers size={12} />, run: onBatch },
+    { label: '1-Click Extract', hint: '⌘E', icon: <WandSparkles size={12} />, run: onExtract },
+    { label: 'Paste AI JSON Patch', hint: 'round-trip', icon: <FileInput size={12} />, run: onPatchImport },
     { label: 'Switch to Stream', hint: '1', icon: <Command size={12} />, run: () => onMode('stream') },
     { label: 'Switch to Agenda & Matrix', hint: '2', icon: <Command size={12} />, run: () => onMode('agenda') },
-    { label: 'Switch to Review', hint: '3', icon: <Command size={12} />, run: () => onMode('review') },
-    { label: 'Switch to Jev Lab', hint: '4', icon: <Command size={12} />, run: () => onMode('jev') },
-    { label: 'Toggle Jev Auto/Off', hint: 'settings', icon: <Zap size={12} />, run: onToggleJev },
+    { label: 'Switch to Triage', hint: '3', icon: <Command size={12} />, run: () => onMode('triage') },
+    { label: 'Switch to Studio', hint: '4', icon: <Command size={12} />, run: () => onMode('studio') },
     { label: 'Export JSON', hint: 'backup', icon: <Download size={12} />, run: () => window.open(exportUrl('json'), '_blank') },
-    {
-      label: 'Force Jev recalculation',
-      hint: selectedId ? 'selected' : 'no selection',
-      icon: <Zap size={12} />,
-      disabled: !selectedId,
-      run: () => { if (selectedId) onForceJev(selectedId); },
-    },
+    { label: 'Extract selected capture', hint: selectedId ? 'selected' : 'no selection', icon: <WandSparkles size={12} />, disabled: !selectedId, run: onExtract },
   ];
 
   return (
@@ -75,22 +70,16 @@ export function CommandPalette({
       <div className="w-full max-w-[620px] animate-rise overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--surface)] shadow-2xl">
         <div className="flex items-center gap-2 border-b border-[var(--border)] px-3.5 py-3">
           <Search size={15} className="text-[var(--muted)]" />
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
+          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} dir="auto"
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
                 if (results[0]) { onSelect(results[0]); onClose(); }
                 else if (query.trim()) { onCaptureAuto(); onClose(); }
               }
             }}
-            placeholder="FTS5 + Query DSL search, or type a command…"
-            className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-[var(--muted)]"
-          />
+            placeholder="FTS5 + Query DSL search, or type a command…" className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-[var(--muted)]" />
           <span className="mono rounded border border-[var(--border)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">esc</span>
         </div>
-
         <div className="max-h-[55vh] overflow-y-auto p-1.5">
           {query.trim() ? (
             <div>
@@ -98,23 +87,17 @@ export function CommandPalette({
               {results.map((capture) => (
                 <button key={capture.id} type="button" onClick={() => { onSelect(capture); onClose(); }} className="flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)]">
                   <span className="mono text-[9px] uppercase text-[var(--emerald)]">{capture.bucket.slice(0, 3)}</span>
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text)]">{capture.content}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text)]" dir="auto">{capture.content}</span>
                   <ArrowRight size={12} className="text-[var(--muted)]" />
                 </button>
               ))}
               {!busy && results.length === 0 ? <p className="px-2 py-3 text-[11px] text-[var(--muted)]">No matches. Press Enter to capture this text.</p> : null}
             </div>
           ) : null}
-
           <div className="px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Actions</div>
           {actions.map((action) => (
-            <button
-              key={action.label}
-              type="button"
-              disabled={action.disabled}
-              onClick={() => { action.run(); onClose(); }}
-              className={cn('flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)] disabled:opacity-40')}
-            >
+            <button key={action.label} type="button" disabled={action.disabled} onClick={() => { action.run(); onClose(); }}
+              className={cn('flex w-full items-center gap-2 rounded px-2 py-2 text-left hover:bg-[var(--surface-hover)] disabled:opacity-40')}>
               <span className="text-[var(--muted)]">{action.icon}</span>
               <span className="flex-1 text-[12px] text-[var(--text)]">{action.label}</span>
               <span className="mono text-[10px] text-[var(--muted)]">{action.hint}</span>

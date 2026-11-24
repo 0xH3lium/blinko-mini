@@ -1,41 +1,18 @@
 import type Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
 import {
-  BUCKETS,
-  getCapture,
-  getCaptureRow,
-  getHeadByName,
-  getHeadRow,
-  getReminder,
-  insertEdge,
-  listHeads,
-  setCaptureTags,
-  syncCaptureFts,
-  upsertDecision,
-  upsertReminder,
-  type Bucket,
-  type Capture,
-  type CaptureStatus,
-  type Decision,
-  type EdgeRelation,
-  type HeadRow,
+  BUCKETS, deleteCaptureFts, getCapture, getCaptureRow, getField, getFieldsForCapture, getReminder,
+  getSetting, insertEdge, listRules, setCaptureTags, syncCaptureFts, upsertFieldValue, upsertReminder,
+  type Bucket, type Capture, type CaptureStatus, type CaptureField, type EdgeRelation,
 } from '../db/queries.js';
-import { runDeterministic, fetchReadable } from './deterministic.js';
-import { evaluateHeads, getJevMode, canSpendJev, type JevState } from './jev.js';
+import { runDeterministic, nextDueAt } from './deterministic.js';
+import { applyRulePatch, evaluateRules } from './rules.js';
 import { emit } from '../services/events.service.js';
 
 const DEFAULT_REMINDER_DELAY_MS = 4 * 3_600_000;
 
-export interface ManualDecisionInput {
-  valueText?: string | null;
-  valueNum?: number | null;
-}
-
-export interface ManualLinkInput {
-  targetId: string;
-  relation: EdgeRelation;
-  note?: string | null;
-}
+export interface ManualFieldInput { valueText?: string | null; valueNum?: number | null }
+export interface ManualLinkInput { targetId: string; relation: EdgeRelation; note?: string | null }
 
 export interface CreateCaptureManualInput {
   content: string;
@@ -49,9 +26,11 @@ export interface CreateCaptureManualInput {
   meta?: Record<string, unknown>;
   createdAt?: number;
   reminderDueAt?: number | null;
-  reminderState?: 'pending' | 'notified' | 'done' | 'killed';
-  snoozeCount?: number;
-  decisions?: Record<string, ManualDecisionInput | null>;
+  recurrence?: string | null;
+  expiresAt?: number | null;
+  expireAction?: 'archive' | 'trash' | 'delete';
+  triaged?: boolean;
+  fields?: Record<string, ManualFieldInput | null>;
   links?: ManualLinkInput[];
   fetchUrl?: boolean;
 }
@@ -62,82 +41,28 @@ export interface IngestCaptureAutoInput {
   tgChatId?: number;
   replyToTgMessageId?: number;
   skipUrlFetch?: boolean;
-  forceJev?: boolean;
+  forwarded?: Record<string, unknown>;
 }
 
 export interface PipelineResult {
   capture: Capture | undefined;
-  bucketDecision: Decision | null;
+  bucket: Bucket | null;
   reminderDueAt: number | null;
-  jevUsed: boolean;
+  appended: boolean;
 }
 
-function resolveHead(db: Database.Database, key: string): HeadRow | undefined {
-  return getHeadRow(db, key) ?? getHeadByName(db, key);
-}
+interface FieldWrite { valueText?: string | null; valueNum?: number | null; source?: CaptureField['source']; locked?: boolean }
 
-function humanDecision(
-  db: Database.Database,
-  captureId: string,
-  head: HeadRow,
-  valueText: string | null,
-  valueNum: number | null,
-): void {
-  const probs: Record<string, number> = valueText
-    ? { [valueText]: 1 }
-    : valueNum !== null
-      ? { [String(valueNum)]: 1 }
-      : {};
-  upsertDecision(db, {
-    captureId,
-    headId: head.id,
-    valueText,
-    valueNum,
-    probs,
-    confidence: 1,
-    entropy: 0,
-    source: 'human',
-  });
-}
-
-function syncBucketHead(db: Database.Database, captureId: string, bucket: Bucket, source: 'human' | 'deterministic'): void {
-  const head = getHeadByName(db, 'bucket');
-  if (!head) return;
-  upsertDecision(db, {
-    captureId,
-    headId: head.id,
-    valueText: bucket,
-    valueNum: null,
-    probs: { [bucket]: 1 },
-    confidence: 1,
-    entropy: 0,
-    source,
-  });
-}
-
-function bucketDecisionOf(capture: Capture | undefined, headId: string | undefined): Decision | null {
-  if (!capture || !headId) return null;
-  return Object.values(capture.decisions).find((decision) => decision.headId === headId) ?? null;
-}
-
-export function buildJevState(db: Database.Database, captureId: string): JevState {
-  const capture = getCapture(db, captureId);
-  const state: JevState = { content: capture?.content ?? '', tags: capture?.tags ?? [] };
-  if (capture?.sourceUrl) {
-    state.url = {
-      url: capture.sourceUrl,
-      title: capture.urlTitle ?? '',
-      excerpt: capture.urlExcerpt ?? '',
-    };
+function writeFields(db: Database.Database, captureId: string, fields: Record<string, FieldWrite>): void {
+  for (const [name, value] of Object.entries(fields)) {
+    const field = getField(db, name);
+    if (!field) continue;
+    const source = value.source ?? 'human';
+    upsertFieldValue(db, captureId, field.id, {
+      valueText: value.valueText ?? null, valueNum: value.valueNum ?? null,
+      source, locked: value.locked ?? source === 'human',
+    });
   }
-  const parentRow = db
-    .prepare("SELECT source_id FROM capture_edges WHERE target_id = ? AND relation = 'reply' LIMIT 1")
-    .get(captureId) as { source_id: string } | undefined;
-  if (parentRow) {
-    const parent = getCaptureRow(db, parentRow.source_id);
-    if (parent) state.parentCapture = { bucket: parent.bucket, content: parent.content };
-  }
-  return state;
 }
 
 export async function createCaptureManual(db: Database.Database, input: CreateCaptureManualInput): Promise<PipelineResult> {
@@ -147,6 +72,7 @@ export async function createCaptureManual(db: Database.Database, input: CreateCa
   let urlTitle = input.urlTitle ?? null;
   let urlExcerpt = input.urlExcerpt ?? null;
   if (input.fetchUrl === true && sourceUrl && (!urlTitle || !urlExcerpt)) {
+    const { fetchReadable } = await import('./deterministic.js');
     const readable = await fetchReadable(sourceUrl);
     if (readable) {
       sourceUrl = readable.url;
@@ -154,174 +80,207 @@ export async function createCaptureManual(db: Database.Database, input: CreateCa
       urlExcerpt = urlExcerpt || readable.excerpt || null;
     }
   }
-
   const createdAt = input.createdAt ?? now;
+  const meta = { ...(input.meta ?? {}) };
   db.prepare(
     `INSERT INTO captures
-       (id, content, bucket, status, is_pinned, capture_mode, source_url, url_title, url_excerpt,
-        meta, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.content,
-    input.bucket,
-    input.status,
-    input.isPinned ? 1 : 0,
-    sourceUrl,
-    urlTitle,
-    urlExcerpt,
-    JSON.stringify(input.meta ?? {}),
-    createdAt,
-    now,
-  );
+       (id, content, bucket, status, is_pinned, capture_mode, triaged, source_url, url_title, url_excerpt,
+        meta, expires_at, expire_action, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, input.content, input.bucket, input.status, input.isPinned ? 1 : 0, input.triaged === false ? 0 : 1,
+    sourceUrl, urlTitle, urlExcerpt, JSON.stringify(meta), input.expiresAt ?? null, input.expireAction ?? 'archive', createdAt, now);
 
-  const run = db.transaction(() => {
+  db.transaction(() => {
     setCaptureTags(db, id, input.tags ?? []);
-    for (const [key, value] of Object.entries(input.decisions ?? {})) {
-      const head = resolveHead(db, key);
-      if (!head || value === null || value === undefined) continue;
-      humanDecision(
-        db,
-        id,
-        head,
-        value.valueText ?? null,
-        value.valueNum ?? null,
-      );
-    }
-    syncBucketHead(db, id, input.bucket, 'human');
+    writeFields(db, id, Object.fromEntries(Object.entries(input.fields ?? {}).filter(([, value]) => value !== null)) as Record<string, FieldWrite>);
     for (const link of input.links ?? []) {
-      if (link.targetId === id) continue;
-      const target = getCaptureRow(db, link.targetId);
-      if (!target) continue;
+      if (link.targetId === id || !getCaptureRow(db, link.targetId)) continue;
       insertEdge(db, id, link.targetId, link.relation, link.note ?? null);
     }
     if (input.reminderDueAt !== undefined && input.reminderDueAt !== null) {
-      upsertReminder(db, id, {
-        dueAt: input.reminderDueAt,
-        state: input.reminderState ?? 'pending',
-        snoozeCount: input.snoozeCount ?? 0,
-      });
+      upsertReminder(db, id, { dueAt: input.reminderDueAt, state: 'pending', recurrence: input.recurrence ?? null });
     }
     syncCaptureFts(db, id);
-  });
-  run();
+  })();
 
   const capture = getCapture(db, id);
-  const head = getHeadByName(db, 'bucket');
   emit('capture.created', capture);
-  return {
-    capture,
-    bucketDecision: bucketDecisionOf(capture, head?.id),
-    reminderDueAt: getReminder(db, id)?.dueAt ?? null,
-    jevUsed: false,
-  };
+  return { capture, bucket: input.bucket, reminderDueAt: input.reminderDueAt ?? null, appended: false };
 }
 
+/** Deterministic ingestion: micro-syntax → rules → tags/fields/ reminders/TTL/edges → FTS. No model calls. */
 export async function ingestCaptureAuto(db: Database.Database, input: IngestCaptureAutoInput): Promise<PipelineResult> {
-  const deterministic = await runDeterministic(input.content, new Date(), input.skipUrlFetch === true);
+  const deterministic = await runDeterministic(input.content, new Date(), { db, skipUrlFetch: input.skipUrlFetch === true });
 
-  if (deterministic.manualBypass) {
-    return createCaptureManual(db, {
-      content: deterministic.text,
-      bucket: deterministic.bucketHint ?? 'idea',
-      status: 'active',
-      isPinned: false,
-      tags: deterministic.tags,
-      sourceUrl: deterministic.sourceUrl,
-      urlTitle: deterministic.urlTitle,
-      urlExcerpt: deterministic.urlExcerpt,
-      meta: deterministic.meta,
-      reminderDueAt: deterministic.parsedDueAt,
-    });
+  if (deterministic.appendToLast || deterministic.linkToLast) {
+    const last = db.prepare(
+      "SELECT id FROM captures WHERE deleted_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    ).get() as { id: string } | undefined;
+    if (last) {
+      if (deterministic.appendToLast) {
+        const previous = getCapture(db, last.id);
+        const content = `${previous?.content ?? ''}\n${deterministic.text}`.trim();
+        db.prepare('UPDATE captures SET content = ?, updated_at = ? WHERE id = ?').run(content, Date.now(), last.id);
+        setCaptureTags(db, last.id, [...new Set([...(previous?.tags ?? []), ...deterministic.tags])]);
+        syncCaptureFts(db, last.id);
+        emit('capture.updated', getCapture(db, last.id));
+        return { capture: getCapture(db, last.id), bucket: null, reminderDueAt: null, appended: true };
+      }
+    }
   }
 
   const id = nanoid();
   const now = Date.now();
+  const bucketHint = deterministic.bucketHint;
+  const meta: Record<string, unknown> = { ...deterministic.meta };
+  if (input.forwarded) meta.forwarded = input.forwarded;
   db.prepare(
     `INSERT INTO captures
-       (id, content, bucket, status, is_pinned, capture_mode, source_url, url_title, url_excerpt,
-        meta, created_at, updated_at)
-     VALUES (?, ?, ?, 'active', 0, 'auto', ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    deterministic.text,
-    deterministic.bucketHint ?? 'idea',
-    deterministic.sourceUrl,
-    deterministic.urlTitle,
-    deterministic.urlExcerpt,
-    JSON.stringify(deterministic.meta),
-    now,
-    now,
-  );
+       (id, content, bucket, status, is_pinned, capture_mode, triaged, source_url, url_title, url_excerpt,
+        meta, expires_at, expire_action, created_at, updated_at)
+     VALUES (?, ?, ?, 'active', ?, 'auto', 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, deterministic.text, bucketHint ?? 'idea', deterministic.isPinned ? 1 : 0,
+    deterministic.sourceUrl, deterministic.urlTitle, deterministic.urlExcerpt, JSON.stringify(meta),
+    deterministic.expiresAt, deterministic.expireAction, now, now);
 
-  setCaptureTags(db, id, deterministic.tags);
-  if (input.tgMessageId !== undefined && input.tgChatId !== undefined) {
-    db.prepare(
-      `INSERT OR REPLACE INTO telegram_messages (tg_message_id, tg_chat_id, capture_id, role, created_at)
-       VALUES (?, ?, ?, 'input', ?)`,
-    ).run(input.tgMessageId, input.tgChatId, id, now);
-  }
-  if (input.replyToTgMessageId !== undefined) {
-    const parent = db
-      .prepare('SELECT capture_id FROM telegram_messages WHERE tg_message_id = ?')
-      .get(input.replyToTgMessageId) as { capture_id: string } | undefined;
-    if (parent && parent.capture_id !== id) insertEdge(db, id, parent.capture_id, 'reply', null);
-  }
-
-  const headRows = listHeads(db, true)
-    .map((head) => getHeadRow(db, head.id))
-    .filter((head): head is HeadRow => head !== undefined);
-  let jevUsed = false;
-  let bucket = deterministic.bucketHint ?? 'idea';
-
-  if (getJevMode(db) === 'auto' && canSpendJev(db).ok) {
-    const state = buildJevState(db, id);
-    const result = await evaluateHeads(db, state, headRows, input.forceJev ? 'manual' : 'auto');
-    if (result) {
-      jevUsed = true;
-      for (const prediction of result.predictions) {
-        const head = headRows.find((row) => row.id === prediction.headId);
-        if (!head) continue;
-        upsertDecision(db, {
-          captureId: id,
-          headId: head.id,
-          valueText: prediction.valueText,
-          valueNum: prediction.valueNum,
-          probs: prediction.probs,
-          confidence: prediction.confidence,
-          entropy: prediction.entropy,
-          source: 'jev',
-          modelVersion: prediction.modelVersion,
-          latencyMs: result.latencyMs,
-        });
-      }
-      if (!deterministic.bucketHint) {
-        const bucketHead = headRows.find((head) => head.name === 'bucket');
-        const prediction = result.predictions.find((item) => item.headId === bucketHead?.id);
-        if (prediction?.valueText && BUCKETS.includes(prediction.valueText as Bucket)) {
-          bucket = prediction.valueText as Bucket;
-        }
-      }
+  db.transaction(() => {
+    setCaptureTags(db, id, deterministic.tags);
+    if (input.tgMessageId !== undefined && input.tgChatId !== undefined) {
+      db.prepare('INSERT OR REPLACE INTO telegram_messages (tg_message_id, tg_chat_id, capture_id, role, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(input.tgMessageId, input.tgChatId, id, 'input', now);
     }
-  }
+    if (input.replyToTgMessageId !== undefined) {
+      const parent = db.prepare('SELECT capture_id FROM telegram_messages WHERE tg_message_id = ?').get(input.replyToTgMessageId) as { capture_id: string } | undefined;
+      if (parent && parent.capture_id !== id) insertEdge(db, id, parent.capture_id, 'reply', null);
+    }
+    if (deterministic.linkToLast) {
+      const last = db.prepare('SELECT id FROM captures WHERE id <> ? AND deleted_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1').get(id) as { id: string } | undefined;
+      if (last) insertEdge(db, id, last.id, 'refines', '^ link');
+    }
+    if (input.forwarded) setCaptureTags(db, id, [...deterministic.tags, 'forwarded']);
+  })();
 
-  if (deterministic.bucketHint) syncBucketHead(db, id, deterministic.bucketHint, 'deterministic');
-  db.prepare('UPDATE captures SET bucket = ?, updated_at = ? WHERE id = ?').run(bucket, Date.now(), id);
+  writeFields(db, id, deterministic.fields);
+  const captureNow = getCapture(db, id)!;
+  const { patch } = evaluateRules(listRules(db), {
+    content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
+    explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl, hasDue: Boolean(deterministic.parsedDueAt),
+  });
+  db.transaction(() => {
+    applyRulePatch(db, id, patch);
+    for (const rule of listRules(db)) {
+      const { matchedRules } = evaluateRules([rule], {
+        content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
+        explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl,
+      });
+      if (matchedRules.length) db.prepare('UPDATE rules SET hit_count = hit_count + 1, updated_at = ? WHERE id = ?').run(Date.now(), rule.id);
+    }
+  })();
 
-  let reminderDueAt = deterministic.parsedDueAt;
-  if (!reminderDueAt && (bucket === 'reminder' || deterministic.bucketHint === 'reminder')) {
-    reminderDueAt = now + DEFAULT_REMINDER_DELAY_MS;
+  const final = getCapture(db, id)!;
+  let reminderDueAt = deterministic.parsedDueAt ?? (deterministic.recurrence ? nextDueAt(deterministic.recurrence) : null);
+  if (!reminderDueAt && (final.bucket === 'reminder' || bucketHint === 'reminder')) {
+    const hours = Number(getSetting(db, 'default_reminder_hours', '4'));
+    reminderDueAt = now + (Number.isFinite(hours) ? hours : 4) * 3_600_000;
   }
-  if (reminderDueAt) upsertReminder(db, id, { dueAt: reminderDueAt });
+  if (reminderDueAt) upsertReminder(db, id, { dueAt: reminderDueAt, recurrence: deterministic.recurrence, state: 'pending' });
   syncCaptureFts(db, id);
 
   const capture = getCapture(db, id);
-  const bucketHead = getHeadByName(db, 'bucket');
   emit('capture.created', capture);
-  return {
-    capture,
-    bucketDecision: bucketDecisionOf(capture, bucketHead?.id),
-    reminderDueAt,
-    jevUsed,
-  };
+  return { capture, bucket: capture?.bucket ?? null, reminderDueAt, appended: false };
+}
+
+/** Split a multi-note dump into atomic captures in a single transaction. */
+export async function ingestBatch(db: Database.Database, rawText: string, delimiter = '\n\n'): Promise<{ created: number; captures: Capture[] }> {
+  const notes = rawText.split(delimiter).map((note) => note.trim()).filter(Boolean);
+  const results: Capture[] = [];
+  db.exec('BEGIN');
+  try {
+    for (const note of notes) {
+      const result = await ingestCaptureAuto(db, { content: note, skipUrlFetch: true });
+      if (result.capture) results.push(result.capture);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  emit('capture.bulk', { created: results.length });
+  return { created: results.length, captures: results };
+}
+
+export interface MergeInput { survivorId: string; absorbIds: string[]; mergedContent?: string }
+
+/** Stitch captures: union tags, prefer survivor/human fields, repoint edges, soft-delete absorbed rows. */
+export function mergeCaptures(db: Database.Database, input: MergeInput): Capture | undefined {
+  const survivor = getCapture(db, input.survivorId);
+  if (!survivor) return undefined;
+  const absorbed = input.absorbIds.map((id) => getCapture(db, id)).filter((capture): capture is Capture => capture !== undefined && capture.id !== input.survivorId);
+  db.transaction(() => {
+    const content = input.mergedContent ?? [survivor.content, ...absorbed.map((capture) => capture.content)].filter(Boolean).join('\n\n');
+    const tags = [...new Set([survivor.tags, ...absorbed.map((capture) => capture.tags)].flat())];
+    const mergedFrom = [...new Set([...(Array.isArray(survivor.meta.mergedFrom) ? survivor.meta.mergedFrom as string[] : []), ...absorbed.map((capture) => capture.id)])];
+    db.prepare('UPDATE captures SET content = ?, meta = ?, updated_at = ? WHERE id = ?')
+      .run(content, JSON.stringify({ ...survivor.meta, mergedFrom }), Date.now(), survivor.id);
+    setCaptureTags(db, survivor.id, tags);
+
+    for (const capture of absorbed) {
+      for (const [name, field] of Object.entries(capture.fields)) {
+        const current = getFieldsForCapture(db, survivor.id)[name];
+        if (!current || (!current.locked && field.locked) || (current.source === 'rule' && field.source !== 'rule')) {
+          upsertFieldValue(db, survivor.id, field.fieldId, {
+            valueText: field.valueText, valueNum: field.valueNum, source: field.source, locked: field.locked,
+          });
+        }
+      }
+      const edges = db.prepare('SELECT source_id, target_id, relation, note FROM capture_edges WHERE source_id = ? OR target_id = ?').all(capture.id, capture.id) as Array<{
+        source_id: string; target_id: string; relation: EdgeRelation; note: string | null;
+      }>;
+      db.prepare('DELETE FROM capture_edges WHERE source_id = ? OR target_id = ?').run(capture.id, capture.id);
+      for (const edge of edges) {
+        const source = edge.source_id === capture.id ? survivor.id : edge.source_id;
+        const target = edge.target_id === capture.id ? survivor.id : edge.target_id;
+        insertEdge(db, source, target, edge.relation, edge.note);
+      }
+      db.prepare('UPDATE captures SET deleted_at = ? WHERE id = ?').run(Date.now(), capture.id);
+      deleteCaptureFts(db, capture.id);
+    }
+    syncCaptureFts(db, survivor.id);
+  })();
+  const merged = getCapture(db, survivor.id);
+  emit('capture.bulk', { merged: merged?.id, absorbed: absorbed.map((capture) => capture.id) });
+  return merged;
+}
+
+/** Re-run deterministic extraction and rules after a Telegram edit; never touches human-locked fields. */
+export async function reextractEdited(db: Database.Database, captureId: string, text: string): Promise<Capture | undefined> {
+  const existing = getCapture(db, captureId);
+  if (!existing) return undefined;
+  const parsed = await runDeterministic(text, new Date(), { db, skipUrlFetch: true });
+  const locked = Object.fromEntries(Object.entries(getFieldsForCapture(db, captureId)).filter(([, field]) => field.locked).map(([name, field]) => [name, field]));
+  const { patch } = evaluateRules(listRules(db), {
+    content: parsed.text, tags: parsed.tags, bucket: parsed.bucketHint ?? existing.bucket,
+    explicitBucket: Boolean(parsed.bucketHint), sourceUrl: parsed.sourceUrl ?? existing.sourceUrl,
+  });
+  db.transaction(() => {
+    const sets: string[] = ['content = ?', 'updated_at = ?'];
+    const params: unknown[] = [parsed.text, Date.now()];
+    if (parsed.bucketHint && BUCKETS.includes(parsed.bucketHint)) { sets.push('bucket = ?'); params.push(parsed.bucketHint); }
+    if (parsed.expiresAt !== null) { sets.push('expires_at = ?'); params.push(parsed.expiresAt); }
+    params.push(captureId);
+    db.prepare(`UPDATE captures SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+    setCaptureTags(db, captureId, [...new Set([...parsed.tags, ...(patch.addTags ?? [])])]);
+    applyRulePatch(db, captureId, { ...patch, fields: Object.fromEntries(Object.entries(patch.fields ?? {}).filter(([name]) => !locked[name])) });
+    if (parsed.parsedDueAt || parsed.recurrence) {
+      upsertReminder(db, captureId, {
+        dueAt: parsed.parsedDueAt ?? nextDueAt(parsed.recurrence ?? '') ?? Date.now(),
+        recurrence: parsed.recurrence, state: 'pending', keepRecurrence: true,
+      });
+    }
+    syncCaptureFts(db, captureId);
+  })();
+  const updated = getCapture(db, captureId);
+  emit('capture.updated', updated);
+  return updated;
 }

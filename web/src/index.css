@@ -19,22 +19,7 @@
   --rose: #fb7185;
   --rose-soft: rgba(251, 113, 133, 0.12);
   --cyan: #22d3ee;
-  --app-bg: var(--bg);
-  --app-surface: var(--surface);
-  --app-surface-hover: var(--surface-hover);
-  --app-input: var(--surface-2);
-  --app-border: var(--border);
-  --app-border-strong: var(--border-strong);
-  --app-text: var(--text);
-  --app-hint: var(--hint);
-  --app-muted: var(--muted);
-  --app-accent: var(--emerald);
-  --app-accent-bright: var(--emerald);
-  --app-accent-soft: var(--emerald-soft);
-  --app-accent-border: rgba(52, 211, 153, 0.35);
-  --app-accent-text: #05130d;
-  --app-danger: var(--rose);
-  --app-danger-soft: var(--rose-soft);
+
   color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;

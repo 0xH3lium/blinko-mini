@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.28.5",
-  "description": "Blinko-OS: single-user text-only epistemic capture, Jev distillation, and PC war room.",
+  "description": "BLINKO//OS: deterministic, local-first capture and PC war room.",
   "workspaces": [
     "server",
     "web"
@@ -22,7 +22,6 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
-    "playwright-core": "^1.65.1",
     "typescript": "^5.7.2"
   }
 }

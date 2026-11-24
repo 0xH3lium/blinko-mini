@@ -1,120 +1,82 @@
-# BLINKO//OS
+# BLINKO//OS v2
 
 Single-user, text-only capture and decision-routing system. Telegram is the native input surface; `web/` is a desktop-first PC War Room. Every record is one atomic **capture** routed into six buckets: `idea`, `memory`, `reminder`, `question`, `reference`, `noise`.
 
-The system has no local inference stack, no vector layer, no decay engine, no second LLM, and no force graph. Search is local SQLite FTS5 through a deterministic Query DSL. The only external model is **TypeSafe Jev via OpenRouter System One** (`typesafe/jev-1.14`).
-
-## Architecture
-
-```text
-Telegram text / reactions / inline query ─┐
-PC War Room dual-mode capture modal ──────┼─→ deterministic parser ─→ SQLite (WAL) + FTS5
-                                          │        │                    │
-                                          │        └─ one batched Jev ───┤
-                                          │           (auto mode only)  │
-                                          └──────────────────────────────┴─→ SSE → PC War Room
-```
-
-- **Auto mode:** hashtags, due dates (Asia/Tehran), URL Readability, and bucket prefixes are parsed deterministically. When `jev_mode=auto` and the budget firewall allows it, all active decision heads are evaluated in **one** Jev call. A bucket prefix always wins over Jev's bucket prediction.
-- **Manual mode:** zero Jev calls. The user sets content, bucket, status, pin, tags, reminder, URL metadata, every decision head, manual links, raw `meta`, and `createdAt`.
-- **Edit anything:** the Inspector can patch every capture field, clear individual decisions, add/remove hydrated edges, re-fetch URL metadata, edit timestamps, and validate raw `meta` JSON.
-- **Search:** multi-column FTS5 (`content`, tags, URL title/excerpt) with `bm25` weighting and `<mark>` snippets. No semantic or cosine layer.
-- **Auth:** `/web` issues a 60-second single-use magic link and 8-character code. A 30-day `HttpOnly`, `SameSite=Lax` session cookie is used by the panel (`Secure` only over HTTPS).
-- **Transport:** Telegram polling or webhook, reminder poller, and SSE live updates.
+Zero LLMs, zero external inference APIs, zero semantic/vector layers. Routing, tagging, scoring, linking suggestions, search, TTL expiry and reminders all run locally in SQLite + TypeScript. Every rule, custom field, extractor template and system parameter lives in SQLite and is editable from the panel.
 
 ## Quick start
 
 ```sh
 cp .env.example .env
-# fill BOT_TOKEN, OWNER_TELEGRAM_ID, OPENROUTER_API_KEY
+# fill BOT_TOKEN and OWNER_TELEGRAM_ID
 pnpm install
 pnpm dev            # server :3000 + Vite :5173
 ```
 
-Production:
+Production: `pnpm build && pnpm start`. Send `/web` to the bot, then open the link or paste the 8-character code into the login gate.
 
-```sh
-pnpm build
-pnpm start
-```
-
-Send `/web` to the bot, then open the link or paste the code into the login gate.
+Existing `./data/app.db` databases upgrade automatically on startup: captures, tags, edges, reminders, saved views and auth tokens are preserved; legacy decision heads migrate into custom fields and legacy Jev tables are dropped.
 
 ## Environment
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PUBLIC_URL` | `http://localhost:3000` | Magic-link base and cookie `Secure` decision |
-| `OWNER_TIMEZONE` | `Asia/Tehran` | chrono-node + reminder formatting |
-| `JEV_MODEL` | `typesafe/jev-1.14` | OpenRouter System One model |
-| `JEV_DAILY_CALL_CAP` | `30` | hard call stop |
-| `JEV_DAILY_USD_CAP` | `0.25` | hard daily spend stop |
-| `JEV_MONTHLY_USD_CAP` | `3.00` | hard monthly spend stop |
-| `SESSION_SECRET` | auto in dev | required in production |
+| `PORT` | `3000` | HTTP port |
+| `NODE_ENV` | `development` | runtime mode |
+| `DB_PATH` | `./data/app.db` | SQLite file (`:memory:` for tests) |
+| `PUBLIC_URL` | `http://localhost:3000` | magic-link base and cookie `Secure` decision |
+| `OWNER_TIMEZONE` | `Asia/Tehran` | due dates, recurrence, digest time |
+| `BOT_TOKEN` / `OWNER_TELEGRAM_ID` | required | single-owner Telegram transport |
+| `BOT_MODE` | `polling` | `polling` or `webhook` (+ `WEBHOOK_*`) |
+| `SESSION_SECRET` | random in dev | required in production |
 | `DEV_AUTH_BYPASS` | off | rejected in production |
 
-## Capture prefixes
+The in-app settings table additionally owns `owner_timezone`, `burst_window_sec`, `stub_max_chars`, `stale_days`, `trash_retention_days`, `default_reminder_hours`, `digest_enabled`, `digest_time`, `obsidian_vault`, `obsidian_folder`, and `inline_syntax_enabled`.
 
-`!m` / `!raw` bypass Jev entirely and open a manual capture path. `!rem`, `remind`, `mem:`, `idea:`, `q:`, and `ref:` set bucket hints. `#hashtags`, dates, and URLs are parsed in both modes. URL reads are SSRF-guarded with a 5-second timeout and 500 KB cap.
+## Inline syntax
+
+`i:` / `idea:`, `m:` / `mem:`, `q:`, `r:` / `ref:`, `n:` / `noise:`, `!rem` / `remind` route a note. `++ <text>` appends to the last capture, `^ <text>` links to it, `!pin` pins, `!ttl 15m|2h|3d` sets expiry, and `!every day 8am`, `!every mon,thu 9am`, `!every 6h` schedule recurrence. Custom-field shorthands come from the database: `!L3`, `!act`, `!fals:no`, `!dom:infra`, `@leverage:3`. Unicode hashtags (`#انرژی`, `#work`) work in both scripts.
 
 ## Query DSL
 
-Search is deterministic and local:
-
-| Token | Meaning |
-| --- | --- |
-| `b:idea` / `-b:noise` | include / exclude bucket |
-| `status:active` / `-status:archived` | include / exclude status (`all` disables the filter) |
-| `#tag` / `-#tag` | include / exclude tag |
-| `is:pinned` / `-is:pinned` | pinned filter |
-| `mode:auto` / `mode:manual` | capture mode |
-| `has:url` / `has:due` / `has:links` | presence filters |
-| `due:overdue` / `due:today` / `due:week` | reminder windows |
-| `leverage>=2`, `actionable:yes`, `entropy>0.55` | decision filters |
-| bare words | FTS5 prefix terms with weighted `bm25` ranking |
-
-Example: `b:idea leverage>=2 #work -#draft`.
-
-## PC War Room
-
-- `[1] Stream` — query bar, saved views, sort by any active head, real hydrated columns, shift-click multi-select, bulk actions, and `j/k`, `space`, `p`, `r`, `x`, `e` keys.
-- `[2] Agenda & Matrix` — overdue/today/upcoming/snoozed reminders and a static 2D SVG decision matrix. No physics simulation.
-- `[3] Review` — uncertain Jev decisions and unclassified captures, with `1–6` bucket hotkeys and immediate queue advancement.
-- `[4] Jev Lab` — auto/off firewall, head studio with full config, targeted sweeps with token-based USD previews, and a pure Jev playground.
-- `⌘K` — command palette. `⌘M` — manual capture. The right Inspector is ~420px and edits every field.
+`b:idea`, `-b:noise`, `status:active`, `#tag`, `-#tag`, `is:pinned`, `is:triaged`, `is:trash`, `mode:auto`, `has:url|due|links|ttl|fields|tags`, `due:overdue|today|week`, `len<25`, `age>14d`, `leverage>=2`, `domain:infra`, plus bare FTS5 words. Sorts: `relevance`, `recent`, `updated`, `due`, `length`, `field:<name>`. Persian/Arabic spelling variants and digits are normalized for search only; stored content is untouched.
 
 ## API
 
-All `/api/*` routes except `/api/health` require the session cookie (or non-production `DEV_AUTH_BYPASS`).
+All `/api/*` routes except `/api/health` require the session cookie.
 
 ```text
-GET    /api/health                         public
-GET    /api/events                         SSE: connected, capture.*, edge.updated, reminder.updated, telemetry.updated, sweep.progress
-GET    /api/captures                       q, bucket, status, tag, sort, order, limit, offset
-POST   /api/captures                       { mode: 'auto' | 'manual', ... }
-POST   /api/captures/bulk                  ids + bucket/status/isPinned/addTags/removeTags/delete/runJev
-GET    /api/captures/:id                   hydrated detail with edges and reminder
-PATCH  /api/captures/:id                   edit literally any field
-DELETE /api/captures/:id
-POST   /api/captures/:id/override
-DELETE /api/captures/:id/decisions/:headId
-POST   /api/captures/:id/jev               optional { headIds }
-POST   /api/captures/:id/fetch-url
-POST   /api/captures/:id/edges             DELETE with the same body
-GET    /api/review
-GET    /api/agenda
-GET/POST/PATCH/DELETE /api/heads
-POST   /api/heads/:id/sweep/preview|run
-POST   /api/heads/test
-GET/POST/PATCH/DELETE /api/views
-GET    /api/telemetry
-PATCH  /api/settings                       only { jev_mode: 'auto' | 'off' }
-GET    /api/export?format=json|md
+GET/POST /api/captures                 list (q, sort, limit) / create
+POST     /api/captures/batch           split a multi-note dump into atomic captures
+POST     /api/captures/merge           stitch captures, union tags/fields, repoint edges
+GET      /api/captures/:id/related     local FTS5 + tag-overlap suggestions
+POST     /api/captures/:id/reminder/action   done|snooze1|snooze4|tomorrow|week|kill
+POST     /api/captures/:id/restore     restore from soft trash
+DELETE   /api/captures/:id?permanent=true
+GET      /api/triage                   inbox, bursts, stubs, stale
+GET      /api/agenda
+GET/POST/PATCH/DELETE /api/fields|rules|extractors
+POST     /api/rules/test|/api/rules/sweep/preview|/api/rules/sweep/run
+POST     /api/extract                  compile an extractor template (+ token estimate)
+POST     /api/patch/preview|/api/patch/apply   external-AI JSON round trip
+GET/PATCH /api/settings
+POST     /api/system/maintenance       rebuild_fts|vacuum|empty_trash|run_ttl
+POST     /api/import/json              idempotent backup restore
+GET      /api/export?format=json|md&includeTrash=true
+GET      /api/events                   SSE: capture.*, reminder.updated, telemetry.updated
 ```
+
+## PC War Room
+
+- `[1] Stream` — Query DSL, dynamic field columns, 1-click extract, bulk actions, burst grouping, soft trash.
+- `[2] Agenda & Matrix` — reminder actions with recurrence badges and a draggable 2D field matrix.
+- `[3] Triage` — Inbox, Bursts, Stubs, Stale with keyboard flow and AI patch import.
+- `[4] Studio` — Rules Engine (builder + simulator + retroactive sweeps), Custom Fields, AI Extractors, System Config & Maintenance.
+- `⌘K` search · `⌘M` manual capture · `⌘E` extract.
 
 ## Schema highlights
 
-`captures`, `captures_fts` (multi-column FTS5, service-layer sync), `tags`/`capture_tags`, `telegram_messages`, `capture_edges`, `reminders`, `decision_heads`, `capture_decisions` (one authoritative row per capture/head), `jev_usage`, `saved_views`, `app_settings`, `auth_tokens`. The four seeded heads are `bucket` (choice), `leverage` (score 0–3), `actionable` (noul), and `falsifiable` (noul). The default saved views are `High Leverage`, `Actionable Open`, and `Unread Links`.
+`captures` (with `triaged`, `expires_at`, `expire_action`, `deleted_at`), `captures_fts`, `tags`/`capture_tags`, `telegram_messages`, `capture_edges`, `reminders` (with `recurrence`), `custom_fields`/`capture_fields`, `rules`, `extractor_templates`, `saved_views`, `app_settings`, `auth_tokens`. SQLite WAL, explicit FTS sync, bounded cache/mmap and no model runtime keep RSS low for Raspberry Pi deployments.
 
 ## Verification
 

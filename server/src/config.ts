@@ -23,13 +23,6 @@ const envSchema = z
     WEBHOOK_PATH: z.string().default('/telegram/webhook'),
     WEBHOOK_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
 
-    OPENROUTER_API_KEY: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
-    JEV_MODEL: z.string().default('typesafe/jev-1.14'),
-    JEV_DAILY_CALL_CAP: z.coerce.number().int().nonnegative().default(30),
-    JEV_DAILY_USD_CAP: z.coerce.number().nonnegative().default(0.25),
-    JEV_MONTHLY_USD_CAP: z.coerce.number().nonnegative().default(3),
-
-
     SESSION_SECRET: z.preprocess((value) => (value === '' ? undefined : value), z.string().optional()),
     DEV_AUTH_BYPASS: z
       .string()

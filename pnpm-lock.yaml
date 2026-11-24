@@ -11,9 +11,6 @@ importers:
       concurrently:
         specifier: ^9.1.2
         version: 9.2.5
-      playwright-core:
-        specifier: ^1.65.1
-        version: 1.65.1
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
@@ -26,9 +23,6 @@ importers:
       '@mozilla/readability':
         specifier: ^0.6.0
         version: 0.6.0
-      '@typesafe-ai/sdk':
-        specifier: ^0.7.0
-        version: 0.7.0
       better-sqlite3:
         specifier: ^12.2.0
         version: 12.11.1
@@ -740,10 +734,6 @@ packages:
   '@types/trusted-types@2.0.7':
     resolution: {integrity: sha512-ScaPdn1dQczgbl0QFTeTOmVHFULt394XJgOQNoyVhZ6r2vLnMLJfBPd53SB52T/3G36VI1/g2MZaX0cwDuXsfw==}
 
-  '@typesafe-ai/sdk@0.7.0':
-    resolution: {integrity: sha512-Yg3OZArCQMJx98ut8QVkhx3rFo9ON7pz8Hjzv8c3FGz69Sk8jYftLOlz+Wf6kq6jol/1m08aBnjRAzJr2x3GoQ==}
-    engines: {node: '>=22'}
-
   '@vitejs/plugin-react@4.7.0':
     resolution: {integrity: sha512-gUu9hwfWvvEDBBmgtAowQCojwZmJ5mcLn3aufeCsitijs3+f2NsrPtlAWIR6OPiqljl96GVCUbLe0HyqIpVaoA==}
     engines: {node: ^14.18.0 || >=16.0.0}
@@ -1238,11 +1228,6 @@ packages:
   pirates@4.0.7:
     resolution: {integrity: sha512-TfySrs/5nm8fQJDcBDuUng3VOUKsd7S+zqvbOTiGXHfxX4wK31ard+hoNuvkicM/2YFzlpDgABOevKSsB4G/FA==}
     engines: {node: '>= 6'}
-
-  playwright-core@1.65.1:
-    resolution: {integrity: sha512-hqPpz7blSMPxWVdoeE1yiBSzXsKiVOd2k+kjCvmUywD2GPO2Dd9HfcWnq9NN0GHbNZDFgZ9JfBFr+X5/BLo0qw==}
-    engines: {node: '>=20'}
-    hasBin: true
 
   postcss-import@15.1.0:
     resolution: {integrity: sha512-hpr+J05B2FVYUAXHeK1YyI267J/dDDhMU6B6civm8hSY1jYJnBXxzKDKDswzJmtLHryrjhnDjqqp/49t8FALew==}
@@ -1995,8 +1980,6 @@ snapshots:
   '@types/trusted-types@2.0.7':
     optional: true
 
-  '@typesafe-ai/sdk@0.7.0': {}
-
   '@vitejs/plugin-react@4.7.0(supports-color@8.1.1)(vite@6.4.6(@types/node@22.20.5)(jiti@1.21.7)(tsx@4.23.15))':
     dependencies:
       '@babel/core': 7.29.13(supports-color@8.1.1)
@@ -2471,8 +2454,6 @@ snapshots:
   picomatch@4.0.7: {}
 
   pirates@4.0.7: {}
-
-  playwright-core@1.65.1: {}
 
   postcss-import@15.1.0(postcss@8.5.33):
     dependencies:
