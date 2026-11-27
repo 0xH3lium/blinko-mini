@@ -66,6 +66,20 @@ GET      /api/export?format=json|md&includeTrash=true
 GET      /api/events                   SSE: capture.*, reminder.updated, telemetry.updated
 ```
 
+## Telegram bot
+
+Every capture reply carries an inline keyboard: bucket switch, pin, triage, resolve, trash **+ one-tap undo**, leverage, set reminder. Reminder messages keep live `Done / Snooze +1h / +4h / Tomorrow 9am / +1w / Kill` controls.
+
+- `/inbox` — interactive one-at-a-time triage (bucket buttons, triaged/trash/skip, prev/next, progress).
+- `/triage` — counts + start triage.
+- `/remind` — one actionable card per reminder.
+- `/digest` — tactical briefing with triage/reminders/refresh buttons.
+- `/search <q>` — Query DSL, paginated; `/search` then type.
+- `/batch` — collect notes, `/done` saves all (single transaction), `/cancel` aborts; `/batch` + blank-line notes still works.
+- `/cancel`, `/done`, `/web`, `/extract`, `/rules`, `/help`.
+- Native command menu (`setMyCommands`) + chat menu button registered on startup.
+- Emoji reactions still work: 📌 pin · ✅ resolve · 👎/💩 trash · 🔥 leverage=3 · 👌 triaged.
+
 ## PC War Room
 
 - `[1] Stream` — Query DSL, dynamic field columns, 1-click extract, bulk actions, burst grouping, soft trash.

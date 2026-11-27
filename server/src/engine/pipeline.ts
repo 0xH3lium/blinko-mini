@@ -162,13 +162,14 @@ export async function ingestCaptureAuto(db: Database.Database, input: IngestCapt
 
   writeFields(db, id, deterministic.fields);
   const captureNow = getCapture(db, id)!;
-  const { patch } = evaluateRules(listRules(db), {
+  const rules = listRules(db); // fetch once; avoid N+1 inside the hit-count loop
+  const { patch } = evaluateRules(rules, {
     content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
     explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl, hasDue: Boolean(deterministic.parsedDueAt),
   });
   db.transaction(() => {
     applyRulePatch(db, id, patch);
-    for (const rule of listRules(db)) {
+    for (const rule of rules) {
       const { matchedRules } = evaluateRules([rule], {
         content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
         explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl,
@@ -184,7 +185,7 @@ export async function ingestCaptureAuto(db: Database.Database, input: IngestCapt
     reminderDueAt = now + (Number.isFinite(hours) ? hours : 4) * 3_600_000;
   }
   if (reminderDueAt) upsertReminder(db, id, { dueAt: reminderDueAt, recurrence: deterministic.recurrence, state: 'pending' });
-  syncCaptureFts(db, id);
+  // applyRulePatch already synced FTS; reminders are not FTS-indexed.
 
   const capture = getCapture(db, id);
   emit('capture.created', capture);
