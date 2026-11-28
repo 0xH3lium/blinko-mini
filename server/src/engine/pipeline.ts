@@ -5,7 +5,7 @@ import {
   getSetting, insertEdge, listRules, setCaptureTags, syncCaptureFts, upsertFieldValue, upsertReminder,
   type Bucket, type Capture, type CaptureStatus, type CaptureField, type EdgeRelation,
 } from '../db/queries.js';
-import { runDeterministic, nextDueAt } from './deterministic.js';
+import { runDeterministic, nextDueAt, ownerTimeZone } from './deterministic.js';
 import { applyRulePatch, evaluateRules } from './rules.js';
 import { emit } from '../services/events.service.js';
 
@@ -108,24 +108,30 @@ export async function createCaptureManual(db: Database.Database, input: CreateCa
   return { capture, bucket: input.bucket, reminderDueAt: input.reminderDueAt ?? null, appended: false };
 }
 
-/** Deterministic ingestion: micro-syntax → rules → tags/fields/ reminders/TTL/edges → FTS. No model calls. */
+/** Deterministic ingestion: micro-syntax → rules → tags/fields/reminders/TTL/edges → FTS. No model calls. */
 export async function ingestCaptureAuto(db: Database.Database, input: IngestCaptureAutoInput): Promise<PipelineResult> {
   const deterministic = await runDeterministic(input.content, new Date(), { db, skipUrlFetch: input.skipUrlFetch === true });
+  return commitAutoIngest(db, input, deterministic, true);
+}
 
-  if (deterministic.appendToLast || deterministic.linkToLast) {
+/** All work here is synchronous so a batch can hold one short SQLite transaction. */
+function commitAutoIngest(
+  db: Database.Database, input: IngestCaptureAutoInput,
+  deterministic: Awaited<ReturnType<typeof runDeterministic>>, emitEvent = true,
+): PipelineResult {
+  if (deterministic.appendToLast) {
     const last = db.prepare(
-      "SELECT id FROM captures WHERE deleted_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      'SELECT id FROM captures WHERE deleted_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1',
     ).get() as { id: string } | undefined;
     if (last) {
-      if (deterministic.appendToLast) {
-        const previous = getCapture(db, last.id);
-        const content = `${previous?.content ?? ''}\n${deterministic.text}`.trim();
-        db.prepare('UPDATE captures SET content = ?, updated_at = ? WHERE id = ?').run(content, Date.now(), last.id);
-        setCaptureTags(db, last.id, [...new Set([...(previous?.tags ?? []), ...deterministic.tags])]);
-        syncCaptureFts(db, last.id);
-        emit('capture.updated', getCapture(db, last.id));
-        return { capture: getCapture(db, last.id), bucket: null, reminderDueAt: null, appended: true };
-      }
+      const previous = getCapture(db, last.id);
+      const content = `${previous?.content ?? ''}\n${deterministic.text}`.trim();
+      db.prepare('UPDATE captures SET content = ?, updated_at = ? WHERE id = ?').run(content, Date.now(), last.id);
+      setCaptureTags(db, last.id, [...new Set([...(previous?.tags ?? []), ...deterministic.tags])]);
+      syncCaptureFts(db, last.id);
+      const appended = getCapture(db, last.id);
+      if (emitEvent) emit('capture.updated', appended);
+      return { capture: appended, bucket: null, reminderDueAt: null, appended: true };
     }
   }
 
@@ -134,16 +140,17 @@ export async function ingestCaptureAuto(db: Database.Database, input: IngestCapt
   const bucketHint = deterministic.bucketHint;
   const meta: Record<string, unknown> = { ...deterministic.meta };
   if (input.forwarded) meta.forwarded = input.forwarded;
-  db.prepare(
-    `INSERT INTO captures
-       (id, content, bucket, status, is_pinned, capture_mode, triaged, source_url, url_title, url_excerpt,
-        meta, expires_at, expire_action, created_at, updated_at)
-     VALUES (?, ?, ?, 'active', ?, 'auto', 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, deterministic.text, bucketHint ?? 'idea', deterministic.isPinned ? 1 : 0,
-    deterministic.sourceUrl, deterministic.urlTitle, deterministic.urlExcerpt, JSON.stringify(meta),
-    deterministic.expiresAt, deterministic.expireAction, now, now);
 
   db.transaction(() => {
+    db.prepare(
+      `INSERT INTO captures
+         (id, content, bucket, status, is_pinned, capture_mode, triaged, source_url, url_title, url_excerpt,
+          meta, expires_at, expire_action, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, 'auto', 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, deterministic.text, bucketHint ?? 'idea', deterministic.isPinned ? 1 : 0,
+      deterministic.sourceUrl, deterministic.urlTitle, deterministic.urlExcerpt, JSON.stringify(meta),
+      deterministic.expiresAt, deterministic.expireAction, now, now);
+
     setCaptureTags(db, id, deterministic.tags);
     if (input.tgMessageId !== undefined && input.tgChatId !== undefined) {
       db.prepare('INSERT OR REPLACE INTO telegram_messages (tg_message_id, tg_chat_id, capture_id, role, created_at) VALUES (?, ?, ?, ?, ?)')
@@ -158,55 +165,47 @@ export async function ingestCaptureAuto(db: Database.Database, input: IngestCapt
       if (last) insertEdge(db, id, last.id, 'refines', '^ link');
     }
     if (input.forwarded) setCaptureTags(db, id, [...deterministic.tags, 'forwarded']);
-  })();
 
-  writeFields(db, id, deterministic.fields);
-  const captureNow = getCapture(db, id)!;
-  const rules = listRules(db); // fetch once; avoid N+1 inside the hit-count loop
-  const { patch } = evaluateRules(rules, {
-    content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
-    explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl, hasDue: Boolean(deterministic.parsedDueAt),
-  });
-  db.transaction(() => {
-    applyRulePatch(db, id, patch);
-    for (const rule of rules) {
-      const { matchedRules } = evaluateRules([rule], {
+    writeFields(db, id, deterministic.fields);
+    if (!deterministic.manualBypass) {
+      const captureNow = getCapture(db, id)!;
+      const rules = listRules(db);
+      const { matchedRules, patch } = evaluateRules(rules, {
         content: captureNow.content, tags: captureNow.tags, bucket: captureNow.bucket,
-        explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl,
+        explicitBucket: Boolean(bucketHint), sourceUrl: captureNow.sourceUrl, hasDue: Boolean(deterministic.parsedDueAt),
       });
-      if (matchedRules.length) db.prepare('UPDATE rules SET hit_count = hit_count + 1, updated_at = ? WHERE id = ?').run(Date.now(), rule.id);
+      applyRulePatch(db, id, patch);
+      for (const match of matchedRules) {
+        db.prepare('UPDATE rules SET hit_count = hit_count + 1, updated_at = ? WHERE id = ?').run(now, match.id);
+      }
     }
+    syncCaptureFts(db, id);
   })();
 
   const final = getCapture(db, id)!;
-  let reminderDueAt = deterministic.parsedDueAt ?? (deterministic.recurrence ? nextDueAt(deterministic.recurrence) : null);
+  const timeZone = ownerTimeZone(db);
+  let reminderDueAt = deterministic.parsedDueAt ?? (deterministic.recurrence ? nextDueAt(deterministic.recurrence, now, timeZone) : null);
   if (!reminderDueAt && (final.bucket === 'reminder' || bucketHint === 'reminder')) {
     const hours = Number(getSetting(db, 'default_reminder_hours', '4'));
     reminderDueAt = now + (Number.isFinite(hours) ? hours : 4) * 3_600_000;
   }
   if (reminderDueAt) upsertReminder(db, id, { dueAt: reminderDueAt, recurrence: deterministic.recurrence, state: 'pending' });
-  // applyRulePatch already synced FTS; reminders are not FTS-indexed.
+  // Reminders are not FTS-indexed; the capture row was indexed in the transaction above.
 
-  const capture = getCapture(db, id);
-  emit('capture.created', capture);
-  return { capture, bucket: capture?.bucket ?? null, reminderDueAt, appended: false };
+  if (emitEvent) emit('capture.created', final);
+  return { capture: final, bucket: final.bucket, reminderDueAt, appended: false };
 }
 
-/** Split a multi-note dump into atomic captures in a single transaction. */
+/** Split a multi-note dump: prep asynchronously, then insert/evaluate all notes in one synchronous transaction. */
 export async function ingestBatch(db: Database.Database, rawText: string, delimiter = '\n\n'): Promise<{ created: number; captures: Capture[] }> {
-  const notes = rawText.split(delimiter).map((note) => note.trim()).filter(Boolean);
-  const results: Capture[] = [];
-  db.exec('BEGIN');
-  try {
-    for (const note of notes) {
-      const result = await ingestCaptureAuto(db, { content: note, skipUrlFetch: true });
-      if (result.capture) results.push(result.capture);
-    }
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
+  const notes = rawText.split(delimiter).map((note) => note.trim()).filter((content) => content)
+    .map((content) => ({ content, deterministic: undefined as Awaited<ReturnType<typeof runDeterministic>> | undefined }));
+  for (const note of notes) {
+    note.deterministic = await runDeterministic(note.content, new Date(), { db, skipUrlFetch: true });
   }
+  const results = db.transaction(() => notes
+    .map((note) => commitAutoIngest(db, { content: note.content, skipUrlFetch: true }, note.deterministic!, false).capture)
+    .filter((capture): capture is Capture => capture !== undefined))();
   emit('capture.bulk', { created: results.length });
   return { created: results.length, captures: results };
 }
@@ -275,7 +274,7 @@ export async function reextractEdited(db: Database.Database, captureId: string, 
     applyRulePatch(db, captureId, { ...patch, fields: Object.fromEntries(Object.entries(patch.fields ?? {}).filter(([name]) => !locked[name])) });
     if (parsed.parsedDueAt || parsed.recurrence) {
       upsertReminder(db, captureId, {
-        dueAt: parsed.parsedDueAt ?? nextDueAt(parsed.recurrence ?? '') ?? Date.now(),
+        dueAt: parsed.parsedDueAt ?? nextDueAt(parsed.recurrence ?? '', Date.now(), ownerTimeZone(db)) ?? Date.now(),
         recurrence: parsed.recurrence, state: 'pending', keepRecurrence: true,
       });
     }

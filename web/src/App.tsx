@@ -29,6 +29,20 @@ import { copyText } from './lib/utils';
 
 interface ToastState { id: number; message: string; tone: ToastTone; action?: ToastAction }
 
+function parseActiveTag(query: string): string | null {
+  return query.split(/\s+/).map((token) => /^-?#([^\s#]+)$/.exec(token)?.[1]).find(Boolean) ?? null;
+}
+
+function toggleQueryTag(query: string, tag: string | null): string {
+  if (!tag) return query.split(/\s+/).filter((part) => !/^-?#([^\s#]+)$/.test(part)).join(' ');
+  const token = `#${tag}`;
+  const parts = query.split(/\s+/).filter(Boolean);
+  const index = parts.findIndex((part) => part.toLowerCase() === token.toLowerCase() || part.toLowerCase() === `-${token.toLowerCase()}`);
+  if (index >= 0) parts.splice(index, 1);
+  else parts.push(token);
+  return parts.join(' ');
+}
+
 export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [mode, setMode] = useState<Mode>('stream');
@@ -48,7 +62,7 @@ export default function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [captureOpen, setCaptureOpen] = useState(false);
-  const [captureMode, setCaptureMode] = useState<'auto' | 'manual'>('auto');
+  const [captureMode, setCaptureMode] = useState<'auto' | 'manual' | 'batch'>('auto');
   const [extractOpen, setExtractOpen] = useState(false);
   const [extractScope, setExtractScope] = useState<{ captureIds?: string[]; q?: string; templateId?: string }>({});
   const [patchOpen, setPatchOpen] = useState(false);
@@ -60,6 +74,9 @@ export default function App() {
   const [order, setOrder] = useState<'asc' | 'desc'>('desc');
   const [activeViewId, setActiveViewId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmEmptyTrash, setConfirmEmptyTrash] = useState(false);
+  const [streamLimit, setStreamLimit] = useState(300);
+  const [railOpen, setRailOpen] = useState(true);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [connected, setConnected] = useState(false);
   const refreshTimer = useRef<number | null>(null);
@@ -83,19 +100,17 @@ export default function App() {
     if (!authed) return;
     const filters = captureFilters();
     const result = await getCaptures({
-      q: filters.q, bucket: filters.bucket, status: filters.status, sort, order, limit: 300,
+      q: filters.q, bucket: filters.bucket, status: filters.status, sort, order, limit: streamLimit,
     });
     if (trashMode) setTrashPage(result); else setPage(result);
-  }, [authed, captureFilters, sort, order, trashMode]);
+  }, [authed, captureFilters, sort, order, trashMode, streamLimit]);
 
-  const refreshMeta = useCallback(async () => {
+  // Studio config is static during capture edits; only volatile views need a refresh after a patch.
+  const refreshStatic = useCallback(async () => {
     if (!authed) return;
-    const [telemetryResult, triageResult, agendaResult, viewsResult, fieldsResult, templatesResult, settingsResult, rulesResult] = await Promise.all([
-      getTelemetry(), getTriage(), getAgenda(), getViews(), getFields(), getExtractors(), getSettings(), getRules(),
+    const [viewsResult, fieldsResult, templatesResult, settingsResult, rulesResult] = await Promise.all([
+      getViews(), getFields(), getExtractors(), getSettings(), getRules(),
     ]);
-    setTelemetry(telemetryResult);
-    setTriage(triageResult);
-    setAgenda(agendaResult);
     setViews(viewsResult.views);
     setFields(fieldsResult.fields);
     setTemplates(templatesResult.templates);
@@ -103,35 +118,89 @@ export default function App() {
     setSettingsDraft(settingsResult.settings);
   }, [authed]);
 
-  const refreshAll = useCallback(async () => {
+  const refreshDynamic = useCallback(async () => {
+    if (!authed) return;
+    const [telemetryResult, triageResult, agendaResult] = await Promise.all([getTelemetry(), getTriage(), getAgenda()]);
+    setTelemetry(telemetryResult);
+    setTriage(triageResult);
+    setAgenda(agendaResult);
+  }, [authed]);
+
+  const refreshDetail = useCallback(async () => {
+    if (!selectedId) return;
+    try { setDetail(await getCapture(selectedId)); }
+    catch { setDetail(null); setSelectedId(null); }
+  }, [selectedId]);
+
+  const refreshCaptures = useCallback(async () => {
     try {
-      await Promise.all([refreshStream(), refreshMeta()]);
-      if (selectedId) {
-        try { setDetail(await getCapture(selectedId)); }
-        catch { setDetail(null); setSelectedId(null); }
-      }
+      await Promise.all([refreshStream(), refreshDynamic(), refreshDetail()]);
     } catch (error) {
       if (error instanceof Error && 'status' in error && (error as { status: number }).status === 401) { setAuthed(false); return; }
       notify(error instanceof Error ? error.message : 'Refresh failed', 'error');
     }
-  }, [refreshStream, refreshMeta, selectedId, notify]);
+  }, [refreshStream, refreshDynamic, refreshDetail, notify]);
 
-  const refreshRef = useRef(refreshAll);
-  refreshRef.current = refreshAll;
+  const refreshAll = useCallback(async () => {
+    try {
+      await Promise.all([refreshStream(), refreshStatic(), refreshDynamic(), refreshDetail()]);
+    } catch (error) {
+      if (error instanceof Error && 'status' in error && (error as { status: number }).status === 401) { setAuthed(false); return; }
+      notify(error instanceof Error ? error.message : 'Refresh failed', 'error');
+    }
+  }, [refreshStream, refreshStatic, refreshDynamic, refreshDetail, notify]);
+
+  const refreshRef = useRef(refreshCaptures);
+  refreshRef.current = refreshCaptures;
 
   useEffect(() => { getMe().then((result) => setAuthed(result.authenticated)).catch(() => setAuthed(false)); }, []);
   useEffect(() => { if (authed) void refreshAll(); }, [authed, refreshAll]);
 
-  // SSE refreshes are scoped: capture events only touch capture views, reminder events only Agenda, etc.
+  // Apply SSE payloads locally; only telemetry is re-fetched, on a debounce.
   useEffect(() => {
     if (!authed) return;
-    const close = openEvents((type) => {
+    const close = openEvents((type, data) => {
       setConnected(true);
-      if (type === 'capture.created' || type === 'capture.updated' || type === 'capture.deleted' || type === 'capture.restored' || type === 'capture.bulk') {
+      if (type === 'capture.created' || type === 'capture.updated' || type === 'capture.deleted' || type === 'capture.restored') {
+        const event = data as { id?: string; deletedAt?: number | null } | null;
+        const id = event?.id;
+        if (!id) return;
+        const incoming = type === 'capture.created' || type === 'capture.updated'
+          ? { ...(event as Capture), deletedAt: type === 'capture.updated' ? (event as Capture).deletedAt : null }
+          : null;
+        const removed = type === 'capture.deleted' || type === 'capture.restored';
+        const change = (capture: Capture): Capture | null => {
+          if (capture.id !== id) return capture;
+          if (removed) return null;
+          return incoming!;
+        };
+        const patchPage = (current: typeof page) => {
+          if (!current || !incoming) return current;
+          const exists = current.captures.some((capture) => capture.id === id);
+          return { ...current, captures: exists ? current.captures.map(change).filter(Boolean) as Capture[] : [incoming, ...current.captures] };
+        };
+        setPage((current) => type === 'capture.deleted' ? (current ? { ...current, captures: current.captures.filter((capture) => capture.id !== id) } : current) : patchPage(current));
+        setTrashPage((current) => type === 'capture.restored' ? (current ? { ...current, captures: current.captures.filter((capture) => capture.id !== id) } : current) : patchPage(current));
+        setDetail((current) => {
+          if (!current || current.id !== id) return current;
+          if (removed && type === 'capture.deleted') return null;
+          return incoming ? { ...incoming, edges: current.edges } : current;
+        });
+        setTriage((current) => {
+          if (!current) return current;
+          const map = (list: Capture[]) => list.map(change).filter((capture): capture is Capture => capture !== null);
+          return {
+            untriaged: map(current.untriaged).filter((capture) => !capture.triaged && capture.status === 'active' && !capture.deletedAt),
+            stubs: map(current.stubs),
+            stale: map(current.stale),
+            bursts: current.bursts.map((burst) => ({ ...burst, captures: map(burst.captures) })),
+          };
+        });
         if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-        refreshTimer.current = window.setTimeout(() => {
-          void refreshRef.current();
-        }, 180);
+        refreshTimer.current = window.setTimeout(() => { void getTelemetry().then(setTelemetry).catch(() => undefined); }, 400);
+      } else if (type === 'capture.bulk') {
+        if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+        refreshTimer.current = window.setTimeout(() => { void refreshRef.current(); }, 180);
       } else if (type === 'reminder.updated') {
         void getAgenda().then(setAgenda).catch(() => undefined);
       } else if (type === 'telemetry.updated') {
@@ -151,12 +220,10 @@ export default function App() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setPaletteOpen(true); return; }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'm') { event.preventDefault(); setCaptureMode('manual'); setCaptureOpen(true); return; }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'e') { event.preventDefault(); setExtractScope({ captureIds: selectedId ? [selectedId] : undefined, q: query }); setExtractOpen(true); return; }
+      if (event.altKey && /^[1-4]$/.test(event.key)) { event.preventDefault(); setMode((['stream', 'agenda', 'triage', 'studio'] as const)[Number(event.key) - 1]!); return; }
       if (typing) return;
       if (event.key === '/') { event.preventDefault(); setPaletteOpen(true); }
-      else if (event.key === '1') setMode('stream');
-      else if (event.key === '2') setMode('agenda');
-      else if (event.key === '3') setMode('triage');
-      else if (event.key === '4') setMode('studio');
+      else if (event.key === '[') setRailOpen((open) => !open);
       else if (event.key === 'Escape') { setInspectorOpen(false); setPaletteOpen(false); setCaptureOpen(false); setExtractOpen(false); setPatchOpen(false); }
     };
     window.addEventListener('keydown', onKey);
@@ -167,42 +234,42 @@ export default function App() {
   const selectById = useCallback((id: string) => { setSelectedId(id); void loadDetail(id); }, [loadDetail]);
 
   const applyPatch = useCallback(async (id: string, patch: CapturePatch) => {
-    try { await updateCapture(id, patch); await refreshAll(); }
+    try { await updateCapture(id, patch); await refreshCaptures(); }
     catch (error) { notify(error instanceof Error ? error.message : 'Save failed', 'error'); }
-  }, [refreshAll, notify]);
+  }, [refreshCaptures, notify]);
 
   const handleBulk = useCallback(async (ids: string[], action: BulkAction) => {
     try {
       const result = await bulkAction(ids, action);
       if (action.type !== 'trash' && action.type !== 'restore') notify(`${result.affected} captures updated`, 'success');
-      await refreshAll();
+      await refreshCaptures();
     } catch (error) { notify(error instanceof Error ? error.message : 'Bulk action failed', 'error'); }
-  }, [refreshAll, notify]);
+  }, [refreshCaptures, notify]);
 
   const handleReminder = useCallback(async (id: string, action: ReminderAction) => {
-    try { await reminderAction(id, action); await refreshAll(); }
+    try { await reminderAction(id, action); await refreshCaptures(); }
     catch (error) { notify(error instanceof Error ? error.message : 'Reminder update failed', 'error'); }
-  }, [refreshAll, notify]);
+  }, [refreshCaptures, notify]);
 
   const handleDelete = useCallback(async (id: string) => {
     try {
       await deleteCapture(id);
       setConfirmDelete(null);
       if (selectedId === id) { setSelectedId(null); setDetail(null); setInspectorOpen(false); }
-      notify('Moved to trash', 'success', { label: 'Undo', run: () => void restoreCapture(id).then(refreshAll) });
-      await refreshAll();
+      notify('Moved to trash', 'success', { label: 'Undo', run: () => void restoreCapture(id).then(refreshCaptures) });
+      await refreshCaptures();
     } catch (error) { notify(error instanceof Error ? error.message : 'Delete failed', 'error'); }
-  }, [selectedId, refreshAll, notify]);
+  }, [selectedId, refreshCaptures, notify]);
 
-  const handleMerge = useCallback(async (ids: string[]) => {
+  const handleMerge = useCallback(async (ids: string[], providedContent?: string) => {
     if (ids.length < 2) { notify('Select at least two captures to stitch', 'error'); return; }
-    const mergedContent = window.prompt('Merged content (leave empty to join originals)', '');
+    const mergedContent = providedContent ?? window.prompt('Merged content (leave empty to join originals)', '');
     try {
       const merged = await mergeCaptures(ids[0]!, ids.slice(1), mergedContent || undefined);
       notify(`Stitched into ${merged.id.slice(0, 8)}`, 'success');
-      await refreshAll();
+      await refreshCaptures();
     } catch (error) { notify(error instanceof Error ? error.message : 'Merge failed', 'error'); }
-  }, [refreshAll, notify]);
+  }, [refreshCaptures, notify]);
 
   const handleExtract = useCallback(async (templateId?: string, captureIds?: string[]) => {
     try {
@@ -228,9 +295,9 @@ export default function App() {
     try {
       await createView({ name, query, sort });
       notify('View saved', 'success');
-      await refreshAll();
+      await refreshStatic();
     } catch (error) { notify(error instanceof Error ? error.message : 'Could not save view', 'error'); }
-  }, [query, sort, refreshAll, notify]);
+  }, [query, sort, refreshStatic, notify]);
 
   const applyView = useCallback((view: SavedView) => {
     setQuery(view.query); setSort(view.sort); setBucket('all'); setTrashMode(false); setActiveViewId(view.id);
@@ -244,6 +311,7 @@ export default function App() {
   const captures = useMemo(() => (trashMode ? trashPage : page)?.captures ?? [], [trashMode, trashPage, page]);
   const bucketCounts = useMemo(() => (trashMode ? trashPage : page)?.bucketCounts ?? {}, [trashMode, trashPage, page]);
   const allTags = useMemo(() => (telemetry?.tags ?? []).map((item) => item.name), [telemetry]);
+  const activeTag = useMemo(() => parseActiveTag(query), [query]);
   const triageCount = triage ? triage.untriaged.length + triage.stubs.length + triage.bursts.length : 0;
 
   if (authed === null) return <div className="flex h-full items-center justify-center text-[var(--muted)]"><LoaderCircle className="animate-spin" size={18} /></div>;
@@ -256,9 +324,10 @@ export default function App() {
       status={status} onStatus={setStatus} sort={sort} onSort={(next) => { setSort(next); setActiveViewId(null); }}
       order={order} onOrder={setOrder} onSaveView={() => void handleSaveView()} selectedId={selectedId}
       onSelect={selectCapture} onBulk={(ids, action) => void handleBulk(ids, action)} onDelete={(capture) => setConfirmDelete(capture.id)}
-      onRestore={(id) => void restoreCapture(id).then(refreshAll)}
-      onEmptyTrash={() => void maintenance('empty_trash').then(() => { notify('Trash emptied', 'success'); void refreshAll(); })}
-      onMerge={(ids) => void handleMerge(ids)} onExtract={(templateId, ids) => {
+      onRestore={(id) => void restoreCapture(id).then(refreshCaptures)}
+      onEmptyTrash={() => setConfirmEmptyTrash(true)}
+      onLoadMore={() => setStreamLimit((limit) => limit + 300)}
+      onMerge={(ids, mergedContent) => void handleMerge(ids, mergedContent)} onExtract={(templateId, ids) => {
         if (templateId || ids) openExtractModal(ids, templateId); else void handleExtract();
       }}
       onBucket={(capture, next) => void applyPatch(capture.id, { bucket: next })}
@@ -272,22 +341,22 @@ export default function App() {
     <div className="flex h-full flex-col overflow-hidden">
       <TopBar mode={mode} onMode={setMode} onSearch={() => setPaletteOpen(true)}
         onCapture={(next) => { setCaptureMode(next); setCaptureOpen(true); }}
-        onBatch={() => { setCaptureMode('auto'); setCaptureOpen(true); }}
+        onBatch={() => { setCaptureMode('batch'); setCaptureOpen(true); }}
         onExtract={() => openExtractModal()}
         onPatchImport={() => setPatchOpen(true)}
         onLogout={() => void logout().catch(() => undefined).finally(() => { setAuthed(false); setPage(null); setDetail(null); })}
         connected={connected} triageCount={triageCount} />
 
-      <div className="flex min-h-0 flex-1">
-        <LeftRail counts={bucketCounts} activeBucket={bucket}
+      <div className="relative flex min-h-0 flex-1">
+        {railOpen ? <LeftRail counts={bucketCounts} activeBucket={bucket}
           onBucket={(next) => { setBucket(next); setActiveViewId(null); setTrashMode(false); }}
           views={views} activeViewId={activeViewId} onView={applyView}
           onSaveView={() => void handleSaveView()}
-          onDeleteView={(id) => void deleteView(id).then(refreshAll)}
-          tags={telemetry?.tags ?? []} activeTag={null} onTag={(next) => { setQuery(next ? `#${next}` : ''); setTrashMode(false); }}
+          onDeleteView={(id) => void deleteView(id).then(refreshStatic)}
+          tags={telemetry?.tags ?? []} activeTag={activeTag} onTag={(next) => { setTrashMode(false); setQuery((current) => toggleQueryTag(current.replace(/\bis:trash\b/g, ''), next)); setActiveViewId(null); }}
           telemetry={telemetry} status={status} onStatus={setStatus}
           trash={trashMode} onTrash={(value) => { setTrashMode(value); if (value) setQuery('is:trash'); else setQuery(''); }}
-          trashCount={telemetry?.trashCount ?? 0} />
+          trashCount={telemetry?.trashCount ?? 0} /> : null}
 
         <main className="relative min-w-0 flex-1 bg-[#090b0d]">
           {mode === 'stream' ? streamView : null}
@@ -298,7 +367,10 @@ export default function App() {
                 onSelect={selectById} onReminderAction={(id, action) => void handleReminder(id, action)}
                 onFieldValue={(id, name, value) => {
                   const field = fields.find((item) => item.name === name);
-                  void applyPatch(id, { fields: { [name]: field?.fieldType === 'boolean' ? { valueText: value === 1 ? 'yes' : 'no', valueNum: value, source: 'human' } : { valueText: String(value), valueNum: value, source: 'human' } } });
+                  const numeric = typeof value === 'number' ? value : null;
+                  void applyPatch(id, { fields: { [name]: field?.fieldType === 'boolean'
+                    ? { valueText: value === 1 ? 'yes' : 'no', valueNum: numeric, source: 'human' }
+                    : { valueText: String(value), valueNum: numeric, source: 'human' } } });
                 }} />
             ) : <Loading />
           ) : null}
@@ -308,7 +380,7 @@ export default function App() {
                 onBucket={(id, next) => void applyPatch(id, { bucket: next })}
                 onTrash={(id) => void deleteCapture(id).then(refreshAll)}
                 onResolve={(id) => void applyPatch(id, { status: 'resolved' })}
-                onStitch={(ids, mergedContent) => void handleMerge(ids)}
+                onStitch={(ids, mergedContent) => void handleMerge(ids, mergedContent)}
                 onLinkThread={(ids) => void Promise.all(ids.slice(1).map((id, index) => addEdge(ids[index]!, id, 'related'))).then(refreshAll).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Link failed', 'error'))}
                 onExtract={() => void extract({ captureIds: triage.untriaged.map((capture) => capture.id) }).then((result) => {
                   void copyText(result.text).then(() => notify(`Copied ${result.captureCount} untriaged captures · ~${result.estimatedTokens} tokens`, 'success'));
@@ -318,11 +390,12 @@ export default function App() {
           ) : null}
           {mode === 'studio' ? (
             <StudioView fields={fields} rules={rules} templates={templates} settings={settingsDraft} captures={captures}
-              onRefresh={refreshAll} notify={notify} />
+              onRefresh={refreshStatic} notify={notify} />
           ) : null}
         </main>
 
         {inspectorOpen ? (
+          <div className="inspector-pane relative z-40">
           <Inspector detail={detail} fields={fields} allTags={allTags} onPatch={applyPatch}
             onClearField={async (id, name) => { await clearField(id, name); await refreshAll(); }}
             onDelete={(id) => setConfirmDelete(id)} onClose={() => setInspectorOpen(false)} onJump={selectById}
@@ -331,13 +404,14 @@ export default function App() {
             onFetchUrl={async (id) => { await fetchUrl(id); await refreshAll(); }}
             onExtract={(_templateId, ids) => openExtractModal(ids)}
             notify={notify} />
+          </div>
         ) : null}
       </div>
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onSelect={selectCapture}
         onCaptureAuto={() => { setCaptureMode('auto'); setCaptureOpen(true); }}
         onCaptureManual={() => { setCaptureMode('manual'); setCaptureOpen(true); }}
-        onMode={setMode} onBatch={() => setCaptureOpen(true)} onExtract={() => openExtractModal()}
+        onMode={setMode} onBatch={() => { setCaptureMode('batch'); setCaptureOpen(true); }} onExtract={() => openExtractModal()}
         onPatchImport={() => setPatchOpen(true)} selectedId={selectedId} />
 
       <CaptureModal open={captureOpen} initialMode={captureMode} fields={fields} tags={allTags} notify={notify}
@@ -351,6 +425,15 @@ export default function App() {
         description="Soft-delete keeps the capture restorable until the trash retention period expires."
         confirmLabel="Move to trash" danger onCancel={() => setConfirmDelete(null)}
         onConfirm={() => { if (confirmDelete) void handleDelete(confirmDelete); }} />
+
+      <ConfirmDialog open={confirmEmptyTrash} title="Empty trash permanently?"
+        description="Every soft-deleted capture will be erased. This cannot be undone."
+        confirmLabel="Empty Trash" danger onCancel={() => setConfirmEmptyTrash(false)}
+        onConfirm={() => {
+          setConfirmEmptyTrash(false);
+          void maintenance('empty_trash').then(() => { notify('Trash emptied', 'success'); void refreshCaptures(); })
+            .catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not empty trash', 'error'));
+        }} />
 
       {toast ? <Toast key={toast.id} message={toast.message} tone={toast.tone} action={toast.action} onDismiss={() => setToast(null)} /> : null}
     </div>

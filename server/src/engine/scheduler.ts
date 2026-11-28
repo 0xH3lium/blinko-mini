@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import type { Bot } from 'grammy';
 import { config } from '../config.js';
 import {
-  deleteCaptureFts, getAgenda, getCapture, getSetting, listDueReminders, setSetting,
+  deleteCaptureFts, deleteOrphanTags, getAgenda, getCapture, getSetting, listDueReminders, setSetting,
   type Capture, type Reminder,
 } from '../db/queries.js';
 import { sendSchedulerReminder, sendTacticalDigest } from '../bot/bot.js';
@@ -33,7 +33,9 @@ export function emptyTrash(db: Database.Database): number {
   const ids = db.prepare('SELECT id FROM captures WHERE deleted_at IS NOT NULL').all() as Array<{ id: string }>;
   const run = db.transaction(() => {
     for (const row of ids) deleteCaptureFts(db, row.id);
-    return db.prepare('DELETE FROM captures WHERE deleted_at IS NOT NULL').run().changes;
+    const count = db.prepare('DELETE FROM captures WHERE deleted_at IS NOT NULL').run().changes;
+    if (count) deleteOrphanTags(db);
+    return count;
   });
   const count = run();
   if (count) emit('capture.bulk', { purged: count });
@@ -43,11 +45,14 @@ export function emptyTrash(db: Database.Database): number {
 export function runTrashPurge(db: Database.Database, now = Date.now()): number {
   const retention = Number(getSetting(db, 'trash_retention_days', '30')) * 86_400_000;
   const cutoff = now - retention;
-  const count = db.prepare('DELETE FROM captures WHERE deleted_at IS NOT NULL AND deleted_at <= ?').run(cutoff).changes;
-  if (count) {
-    db.prepare('DELETE FROM captures_fts WHERE capture_id NOT IN (SELECT id FROM captures)').run();
-    emit('capture.bulk', { trashPurged: count });
-  }
+  const ids = (db.prepare('SELECT id FROM captures WHERE deleted_at IS NOT NULL AND deleted_at <= ?').all(cutoff) as Array<{ id: string }>).map((row) => row.id);
+  const count = db.transaction(() => {
+    const removed = db.prepare('DELETE FROM captures WHERE deleted_at IS NOT NULL AND deleted_at <= ?').run(cutoff).changes;
+    for (const id of ids) deleteCaptureFts(db, id);
+    if (removed) deleteOrphanTags(db);
+    return removed;
+  })();
+  if (count) emit('capture.bulk', { trashPurged: count });
   return count;
 }
 

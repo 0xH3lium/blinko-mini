@@ -98,6 +98,9 @@ test('capture CRUD, custom fields, soft trash, bulk actions, edges and unlimited
       meta: { edited: true }, expiresAt: Date.now() + 60_000, expireAction: 'trash',
     },
   });
+  db.prepare('UPDATE captures SET updated_at = 1 WHERE id = ?').run(id);
+  const touched = await json(`/api/captures/${id}`, cookie, { method: 'PATCH', body: { touch: true } });
+  assert.ok(touched.body.updatedAt > 1000, 'touch must bump updated_at');
   assert.equal(patched.body.bucket, 'reference');
   assert.equal(patched.body.fields.leverage, undefined);
   assert.equal(patched.body.fields.actionable.source, 'human');
@@ -257,4 +260,71 @@ test('field, rule, extractor CRUD, simulator, sweeps, extractor compile and JSON
   assert.equal((await json(`/api/rules/${rule.body.id}`, cookie, { method: 'DELETE' })).status, 200);
   assert.equal((await json(`/api/fields/${field.body.id}`, cookie, { method: 'DELETE' })).status, 200);
   assert.ok(getField(db, 'leverage'));
+});
+
+test('export → wipe → import restores captures, edges, fields, rules, templates, views and settings', async () => {
+  const cookie = await login();
+  const now = Date.now();
+  const a = await json('/api/captures', cookie, { method: 'POST', body: {
+    mode: 'manual', content: 'backup parent #work', bucket: 'idea', status: 'active', isPinned: true,
+    tags: ['work'], fields: { leverage: { valueNum: 3 } }, reminderDueAt: now + 60_000, recurrence: 'daily@08:00',
+  } });
+  const b = await json('/api/captures', cookie, { method: 'POST', body: {
+    mode: 'manual', content: 'backup child', bucket: 'memory', status: 'active', isPinned: false, tags: ['child'],
+  } });
+  await json(`/api/captures/${a.body.capture.id}/edges`, cookie, {
+    method: 'POST', body: { targetId: b.body.capture.id, relation: 'refines', note: 'kept edge' },
+  });
+  await json('/api/fields', cookie, { method: 'POST', body: {
+    name: 'backup_field', alias: 'bf', fieldType: 'text', config: {}, showInStream: true,
+  } });
+  await json('/api/rules', cookie, { method: 'POST', body: {
+    name: 'Backup rule', priority: 7, conditions: { keywords: ['backup'] }, actions: { addTags: ['restored'] },
+  } });
+  await json('/api/extractors', cookie, { method: 'POST', body: {
+    name: 'Backup pack', slug: 'backup-pack', itemTemplate: '{{content}}',
+  } });
+  await json('/api/views', cookie, { method: 'POST', body: { name: 'Backup view', query: '#work' } });
+  await json('/api/settings', cookie, { method: 'PATCH', body: { burst_window_sec: 777 } });
+
+  const snapshot = (item: any) => ({
+    id: item.id, content: item.content, bucket: item.bucket, status: item.status,
+    isPinned: item.isPinned, tags: [...item.tags].sort(),
+    fields: Object.fromEntries(Object.entries(item.fields).map(([name, value]: [string, any]) =>
+      [name, { valueText: value.valueText, valueNum: value.valueNum, source: value.source, locked: value.locked }])),
+    reminder: item.reminder ? { dueAt: item.reminder.dueAt, state: item.reminder.state, recurrence: item.reminder.recurrence } : null,
+    edges: (item.edges ?? []).map((edge: any) => ({ sourceId: edge.sourceId, targetId: edge.targetId, relation: edge.relation, note: edge.note })),
+  });
+  const beforeIds = [a.body.capture.id, b.body.capture.id];
+  const before = await Promise.all(beforeIds.map((id) => json(`/api/captures/${id}`, cookie).then((result) => snapshot(result.body))));
+  const beforeFields = (await json('/api/fields', cookie)).body.fields.map((item: any) => item.name).sort();
+  const beforeRules = (await json('/api/rules', cookie)).body.rules.map((item: any) => item.name).sort();
+  const beforeTemplates = (await json('/api/extractors', cookie)).body.templates.map((item: any) => item.slug).sort();
+  const beforeViews = (await json('/api/views', cookie)).body.views.map((item: any) => item.name).sort();
+
+  const exported = await app.request('/api/export?format=json', { headers: { cookie } });
+  assert.equal(exported.status, 200);
+  const backup = await exported.json() as any;
+  assert.equal(backup.version, 2);
+  assert.ok(backup.captures.length >= 2);
+  assert.ok(backup.fields.length >= 5 && backup.rules.length >= 6 && backup.extractors.length >= 7 && backup.views.length >= 4);
+  assert.ok(backup.edges.every((edge: any) => 'sourceId' in edge && 'targetId' in edge && !('source_id' in edge)));
+
+  db.exec(`DELETE FROM capture_tags; DELETE FROM capture_fields; DELETE FROM reminders; DELETE FROM telegram_messages;
+    DELETE FROM capture_edges; DELETE FROM captures_fts; DELETE FROM captures;
+    DELETE FROM custom_fields; DELETE FROM rules; DELETE FROM extractor_templates; DELETE FROM saved_views; DELETE FROM app_settings;`);
+  assert.equal((await json('/api/captures?status=all', cookie)).body.captures.length, 0);
+
+  const restored = await json('/api/import/json', cookie, { method: 'POST', body: backup });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.body.imported, backup.captures.length);
+  const after = await Promise.all(beforeIds.map((id) => json(`/api/captures/${id}`, cookie).then((result) => snapshot(result.body))));
+  assert.deepEqual(after, before);
+  assert.deepEqual((await json('/api/fields', cookie)).body.fields.map((item: any) => item.name).sort(), beforeFields);
+  assert.deepEqual((await json('/api/rules', cookie)).body.rules.map((item: any) => item.name).sort(), beforeRules);
+  assert.deepEqual((await json('/api/extractors', cookie)).body.templates.map((item: any) => item.slug).sort(), beforeTemplates);
+  assert.deepEqual((await json('/api/views', cookie)).body.views.map((item: any) => item.name).sort(), beforeViews);
+  assert.equal((await json('/api/settings', cookie)).body.settings.burst_window_sec, '777');
+  const searched = await json('/api/captures?q=%22backup%20parent%22', cookie);
+  assert.ok(searched.body.captures.some((item: any) => item.id === a.body.capture.id), 'restored capture must be searchable');
 });

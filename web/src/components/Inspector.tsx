@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { Check, ChevronDown, Link2, Pencil, Pin, Sparkles, Trash2, Unlock, X } from 'lucide-react';
@@ -44,7 +44,10 @@ export function Inspector({
 
   // Buffering text inputs prevents a PATCH on every keystroke; save happens on blur or after 400ms.
   const [urlDraft, setUrlDraft] = useState({ sourceUrl: '', urlTitle: '', urlExcerpt: '', createdAt: '' });
+  const urlFocused = useRef(false);
+  // Drafts follow the selected capture only: an SSE echo must not overwrite in-flight typing.
   useEffect(() => {
+    urlFocused.current = false;
     setEditing(false);
     setDraft(detail?.content ?? '');
     setMetaDraft(JSON.stringify(detail?.meta ?? {}, null, 2));
@@ -52,7 +55,8 @@ export function Inspector({
       sourceUrl: detail?.sourceUrl ?? '', urlTitle: detail?.urlTitle ?? '', urlExcerpt: detail?.urlExcerpt ?? '',
       createdAt: detail ? toLocalInput(detail.createdAt) : '',
     });
-  }, [detail?.id, detail?.content, detail?.meta, detail?.sourceUrl, detail?.urlTitle, detail?.urlExcerpt, detail?.createdAt]);
+  }, [detail?.id]);
+  useEffect(() => { if (!editing) setDraft(detail?.content ?? ''); }, [detail?.id, detail?.content]);
 
   const urlPatch = useMemo((): CapturePatch | null => {
     if (!detail) return null;
@@ -66,7 +70,7 @@ export function Inspector({
   }, [detail, urlDraft]);
 
   useEffect(() => {
-    if (!detail || !urlPatch) return;
+    if (!detail || !urlPatch || urlFocused.current) return;
     const timer = window.setTimeout(() => { void onPatch(detail.id, urlPatch); }, 400);
     return () => window.clearTimeout(timer);
   }, [detail, urlPatch, onPatch]);
@@ -238,13 +242,13 @@ export function Inspector({
       <details className="border-b border-[var(--border)] p-3">
         <summary className="flex cursor-pointer items-center gap-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Source URL & Advanced <ChevronDown size={10} /></summary>
         <div className="mt-2 space-y-1.5">
-          <input value={urlDraft.sourceUrl} onChange={(event) => setUrlDraft({ ...urlDraft, sourceUrl: event.target.value })} dir="auto" onBlur={() => { if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="sourceUrl" className="w-full rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
-          <input value={urlDraft.urlTitle} onChange={(event) => setUrlDraft({ ...urlDraft, urlTitle: event.target.value })} dir="auto" onBlur={() => { if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="urlTitle" className="w-full rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
-          <textarea value={urlDraft.urlExcerpt} onChange={(event) => setUrlDraft({ ...urlDraft, urlExcerpt: event.target.value })} dir="auto" onBlur={() => { if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="urlExcerpt" rows={2} className="w-full resize-y rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
+          <input value={urlDraft.sourceUrl} onChange={(event) => setUrlDraft({ ...urlDraft, sourceUrl: event.target.value })} dir="auto" onFocus={() => { urlFocused.current = true; }} onBlur={() => { urlFocused.current = false; if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="sourceUrl" className="w-full rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
+          <input value={urlDraft.urlTitle} onChange={(event) => setUrlDraft({ ...urlDraft, urlTitle: event.target.value })} dir="auto" onFocus={() => { urlFocused.current = true; }} onBlur={() => { urlFocused.current = false; if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="urlTitle" className="w-full rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
+          <textarea value={urlDraft.urlExcerpt} onChange={(event) => setUrlDraft({ ...urlDraft, urlExcerpt: event.target.value })} dir="auto" onFocus={() => { urlFocused.current = true; }} onBlur={() => { urlFocused.current = false; if (urlPatch) void onPatch(detail.id, urlPatch); }} placeholder="urlExcerpt" rows={2} className="w-full resize-y rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-1 text-[10px] outline-none focus:border-[var(--emerald)]" />
           <button type="button" onClick={() => void onFetchUrl(detail.id)} className="rounded border border-[var(--border)] px-2 py-1 text-[10px] text-[var(--hint)] hover:text-[var(--text)]">Re-fetch Readability</button>
           <div className="mono flex items-center gap-2 pt-1 text-[9px] text-[var(--muted)]">
             <span>captureMode: <span className="text-[var(--emerald)]">{detail.captureMode}</span></span>
-            <label>createdAt <input type="datetime-local" value={urlDraft.createdAt} onChange={(event) => setUrlDraft({ ...urlDraft, createdAt: event.target.value })} onBlur={() => { if (urlPatch) void onPatch(detail.id, urlPatch); }} className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-0.5 text-[9px] outline-none" /></label>
+            <label>createdAt <input type="datetime-local" value={urlDraft.createdAt} onChange={(event) => setUrlDraft({ ...urlDraft, createdAt: event.target.value })} onFocus={() => { urlFocused.current = true; }} onBlur={() => { urlFocused.current = false; if (urlPatch) void onPatch(detail.id, urlPatch); }} className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-0.5 text-[9px] outline-none" /></label>
           </div>
           <textarea value={metaDraft} onChange={(event) => setMetaDraft(event.target.value)} dir="auto" rows={4} className="mono mt-1 w-full resize-y rounded border border-[var(--border)] bg-[#0b0f12] p-1.5 text-[9.5px] outline-none" />
           <button type="button" onClick={saveMeta} className="flex items-center gap-1 rounded border border-[var(--border)] px-2 py-1 text-[10px] text-[var(--emerald)]"><Check size={10} /> Save meta JSON</button>

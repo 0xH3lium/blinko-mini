@@ -17,7 +17,7 @@ export function AgendaMatrixView({
   onQuery: (q: string) => void;
   onSelect: (id: string) => void;
   onReminderAction: (id: string, action: ReminderAction) => void;
-  onFieldValue: (id: string, field: string, value: number) => void;
+  onFieldValue: (id: string, field: string, value: number | string) => void;
 }) {
   const [tab, setTab] = useState<'agenda' | 'matrix'>('agenda');
   const [queryDraft, setQueryDraft] = useState(q);
@@ -89,8 +89,9 @@ export function AgendaMatrixView({
                 <span className="mono absolute bottom-2 right-2 text-[9px] uppercase text-[var(--amber)]">Quick Wins</span>
                 {points.map(({ capture, x, y }) => (
                   <button
-                    key={capture.id} type="button" draggable
-                    onDragEnd={(event) => {
+                    key={capture.id} type="button"
+                    onPointerDown={(event) => {
+                      event.currentTarget.setPointerCapture(event.pointerId);
                       const container = event.currentTarget.parentElement?.getBoundingClientRect();
                       if (!container) return;
                       onFieldValue(capture.id, xField.name, denormalize(xField, (event.clientX - container.left) / container.width));
@@ -127,10 +128,13 @@ function normalizeField(field: CustomField, value: number | string | null | unde
   return Number.isFinite(numeric) ? Math.max(0, Math.min(1, (numeric - min) / Math.max(1, max - min))) : null;
 }
 
-function denormalize(field: CustomField, normalized: number): number {
+function denormalize(field: CustomField, normalized: number): number | string {
   const clamped = Math.max(0, Math.min(1, normalized));
   if (field.fieldType === 'boolean') return clamped >= 0.5 ? 1 : 0;
-  if (field.fieldType === 'choice') return Math.round(clamped * Math.max(0, (field.config.options?.length ?? 1) - 1));
+  if (field.fieldType === 'choice') {
+    const options = field.config.options ?? [];
+    return options[Math.round(clamped * Math.max(0, options.length - 1))]?.value ?? '';
+  }
   const min = field.config.min ?? 0;
   const max = field.config.max ?? 3;
   return Math.round(min + clamped * (max - min));

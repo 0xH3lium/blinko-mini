@@ -227,3 +227,40 @@ test('extractor compilation and patch importer round trip', async () => {
   assert.equal(getSetting(db, 'inline_syntax_enabled', ''), 'false');
   db.close();
 });
+
+test('manual bypass skips rules, and hit counts follow the single stopOnMatch evaluation', async () => {
+  const db = createDatabase(':memory:');
+  db.prepare(`INSERT INTO rules (id, name, conditions_json, actions_json, priority, stop_on_match, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('first', 'First', JSON.stringify({ keywords: ['bypass'] }), JSON.stringify({ addTags: ['first-tag'] }), 1, 1, 1, 1);
+  db.prepare(`INSERT INTO rules (id, name, conditions_json, actions_json, priority, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`).run('second', 'Second', JSON.stringify({ keywords: ['bypass'] }), JSON.stringify({ addTags: ['second-tag'] }), 2, 1, 1);
+
+  const bypassed = await ingestCaptureAuto(db, { content: '!raw bypass this', skipUrlFetch: true });
+  assert.equal(bypassed.capture?.tags.includes('first-tag'), false);
+  assert.equal((db.prepare('SELECT hit_count FROM rules').all() as Array<{ hit_count: number }>).every((row) => row.hit_count === 0), true);
+
+  const normal = await ingestCaptureAuto(db, { content: 'bypass this', skipUrlFetch: true });
+  assert.ok(normal.capture?.tags.includes('first-tag'));
+  assert.equal(normal.capture?.tags.includes('second-tag'), false, 'stopOnMatch must stop the second rule');
+  const hits = Object.fromEntries((db.prepare('SELECT id, hit_count FROM rules').all() as Array<{ id: string; hit_count: number }>).map((row) => [row.id, row.hit_count]));
+  assert.equal(hits.first, 1);
+  assert.equal(hits.second, 0);
+  db.close();
+});
+
+test('restoring a soft-deleted capture restores its FTS row', async () => {
+  const db = createDatabase(':memory:');
+  const service = initCapturesService(db);
+  const created = await createCaptureManual(db, {
+    content: 'searchable after restore', bucket: 'idea', status: 'active', isPinned: false, tags: [],
+    reminderDueAt: null, fields: {}, links: [],
+  });
+  const id = created.capture!.id;
+  assert.ok(service.remove(id));
+  db.prepare('DELETE FROM captures_fts WHERE capture_id = ?').run(id); // as mergeCaptures does
+  assert.equal(db.prepare('SELECT 1 FROM captures_fts WHERE capture_id = ?').get(id), undefined);
+  assert.ok(service.restore(id));
+  assert.ok(db.prepare('SELECT 1 FROM captures_fts WHERE capture_id = ?').get(id));
+  assert.ok(listCaptures(db, { q: 'searchable' }).captures.some((capture) => capture.id === id));
+  db.close();
+});

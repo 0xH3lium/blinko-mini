@@ -20,10 +20,11 @@ function safeSnippet(capture: Capture): string {
 export function StreamView({
   captures, total, fields, templates, telemetrySettings, query, onQuery, status, onStatus, sort, onSort,
   order, onOrder, onSaveView, selectedId, onSelect, onBulk, onDelete, onRestore, onEmptyTrash, onMerge,
-  onExtract, onBucket, onPin, onResolve, onTriage, trashMode, notify,
+  onExtract, onBucket, onPin, onResolve, onTriage, trashMode, notify, onLoadMore,
 }: {
   captures: Capture[];
   total: number;
+  onLoadMore: () => void;
   fields: CustomField[];
   templates: ExtractorTemplate[];
   telemetrySettings: Record<string, string>;
@@ -42,7 +43,7 @@ export function StreamView({
   onDelete: (capture: Capture) => void;
   onRestore: (id: string) => void;
   onEmptyTrash: () => void;
-  onMerge: (ids: string[]) => void;
+  onMerge: (ids: string[], mergedContent?: string) => void;
   onExtract: (templateId?: string, captureIds?: string[]) => void;
   onBucket: (capture: Capture, bucket: Bucket) => void;
   onPin: (capture: Capture) => void;
@@ -111,6 +112,7 @@ export function StreamView({
   }
 
   const ids = [...checked];
+  const activeFieldName = fieldName || fields[0]?.name || '';
   const runBulk = (action: BulkAction) => { onBulk(ids, action); setChecked(new Set()); };
 
   return (
@@ -160,11 +162,11 @@ export function StreamView({
           <button type="button" onClick={() => onExtract(undefined, ids)} className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--emerald)]">⚡ Extract</button>
           <button type="button" onClick={() => { onMerge(ids); setChecked(new Set()); }} className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--hint)]">Stitch / Merge</button>
           <button type="button" onClick={() => runBulk({ type: 'triaged', value: true })} className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--hint)]">Mark Triaged</button>
-          <select value={fieldName} onChange={(event) => setFieldName(event.target.value)} className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-1 text-[10px]">
+          <select value={activeFieldName} onChange={(event) => setFieldName(event.target.value)} className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-1 text-[10px]">
             {fields.map((field) => <option key={field.id} value={field.name}>{field.name}</option>)}
           </select>
           <input value={fieldValue} onChange={(event) => setFieldValue(event.target.value)} dir="auto" placeholder="value" className="w-20 rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-1 text-[10px] outline-none" />
-          <button type="button" onClick={() => { if (fieldName) runBulk({ type: 'setField', name: fieldName, value: fieldValue }); }} className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--hint)]">Set Field</button>
+          <button type="button" onClick={() => { if (activeFieldName) runBulk({ type: 'setField', name: activeFieldName, value: fieldValue }); }} className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--hint)]">Set Field</button>
           <select value={bulkBucket} onChange={(event) => setBulkBucket(event.target.value as Bucket)} className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1 py-1 text-[10px]">
             {BUCKETS.map((bucket) => <option key={bucket}>{bucket}</option>)}
           </select>
@@ -177,7 +179,7 @@ export function StreamView({
         </div>
       ) : null}
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-auto">
         <table className="war-table w-full border-collapse text-left">
           <thead className="sticky top-0 z-10 bg-[#0b0e11]">
             <tr className="border-b border-[var(--border)] text-[9px] uppercase tracking-[0.16em] text-[var(--muted)]">
@@ -202,7 +204,7 @@ export function StreamView({
               const Icon = ICONS[capture.bucket];
               const selected = capture.id === selectedId;
               const previous = captures[index - 1];
-              const inBurst = previous && capture.createdAt - previous.createdAt <= burstSec;
+              const inBurst = sort === 'recent' && previous !== undefined && Math.abs(capture.createdAt - previous.createdAt) <= burstSec;
               const due = capture.reminder?.dueAt;
               const dueTone = due && due < Date.now() ? 'text-[var(--rose)]' : due && due < Date.now() + 86_400_000 ? 'text-[var(--amber)]' : 'text-[var(--muted)]';
               return (
@@ -255,6 +257,9 @@ export function StreamView({
             })}
           </tbody>
         </table>
+        {captures.length > 0 && captures.length < total ? (
+          <button type="button" onClick={onLoadMore} className="block w-full border-b border-[var(--border)] py-2 text-[10px] text-[var(--hint)] hover:text-[var(--emerald)]">Load more · {captures.length}/{total}</button>
+        ) : null}
         {captures.length === 0 ? (
           <div className="flex h-[55%] flex-col items-center justify-center text-center">
             <p className="text-[var(--hint)]">{trashMode ? 'Trash is empty.' : 'No captures in this view.'}</p>

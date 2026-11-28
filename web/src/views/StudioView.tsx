@@ -34,8 +34,8 @@ export function StudioView({
   notify: Notify;
 }) {
   const [tab, setTab] = useState<Tab>('rules');
-  const [ruleId, setRuleId] = useState<string | null>(rules[0]?.id ?? null);
-  const rule = rules.find((item) => item.id === ruleId);
+  const [ruleId, setRuleId] = useState<string | null>(rules[0]?.id ?? '__new__');
+  const rule = ruleId === '__new__' ? undefined : rules.find((item) => item.id === ruleId);
   const [ruleDraft, setRuleDraft] = useState({ name: '', priority: 100, enabled: true, stopOnMatch: false, conditions: '{}', actions: '{}' });
   const [jsonMode, setJsonMode] = useState(false);
   const parsePart = (raw: string): Record<string, unknown> => { try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; } };
@@ -52,16 +52,16 @@ export function StudioView({
   const editingField = fields.find((item) => item.id === fieldId);
   const [fieldDraft, setFieldDraft] = useState({ name: '', alias: '', fieldType: 'score' as CustomField['fieldType'], description: '', config: FIELD_CONFIG.score, showInStream: true, sortOrder: 0 });
 
-  const [templateId, setTemplateId] = useState<string | null>(templates[0]?.id ?? null);
-  const editingTemplate = templates.find((item) => item.id === templateId);
+  const [templateId, setTemplateId] = useState<string | null>(templates[0]?.id ?? '__new__');
+  const editingTemplate = templateId === '__new__' ? undefined : templates.find((item) => item.id === templateId);
   const [templateDraft, setTemplateDraft] = useState({ name: '', slug: '', description: '', outputMode: 'clipboard' as ExtractorTemplate['outputMode'], preamble: '', itemTemplate: '{{content}}', footer: '', includeNeighbors: true, excludeNoise: true, isDefault: false, sortOrder: 0 });
   const [preview, setPreview] = useState<Awaited<ReturnType<typeof extract>> | null>(null);
 
   const [settingsDraft, setSettingsDraft] = useState<Record<string, string>>(settings);
 
   useEffect(() => setSettingsDraft(settings), [settings]);
-  useEffect(() => { if (!ruleId && rules[0]) setRuleId(rules[0].id); }, [rules, ruleId]);
-  useEffect(() => { if (!templateId && templates[0]) setTemplateId(templates[0].id); }, [templates, templateId]);
+  useEffect(() => { if (ruleId === null && rules[0]) setRuleId(rules[0].id); }, [rules, ruleId]);
+  useEffect(() => { if (templateId === null && templates[0]) setTemplateId(templates[0].id); }, [templates, templateId]);
 
   function editRulePart(part: 'conditions' | 'actions', key: string, value: unknown): void {
     let object: Record<string, unknown> = {};
@@ -99,7 +99,7 @@ export function StudioView({
       const actions = JSON.parse(ruleDraft.actions) as Record<string, unknown>;
       const payload = { name: ruleDraft.name, priority: ruleDraft.priority, enabled: ruleDraft.enabled, stopOnMatch: ruleDraft.stopOnMatch, conditions, actions };
       if (rule) await updateRule(rule.id, payload);
-      else await createRule(payload);
+      else setRuleId((await createRule(payload)).id);
       notify('Rule saved', 'success');
       await onRefresh();
     } catch (error) { notify(error instanceof Error ? error.message : 'Invalid rule JSON', 'error'); }
@@ -123,7 +123,7 @@ export function StudioView({
     try {
       const payload = { ...templateDraft, id: undefined };
       if (editingTemplate) await updateExtractor(editingTemplate.id, payload);
-      else await createExtractor(payload);
+      else setTemplateId((await createExtractor(payload)).id);
       notify('Extractor saved', 'success');
       await onRefresh();
     } catch (error) { notify(error instanceof Error ? error.message : 'Template save failed', 'error'); }
@@ -161,7 +161,7 @@ export function StudioView({
             <section className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Rules · {rules.length}</h2>
-                <button type="button" onClick={() => setRuleId(null)} title="New rule" className="text-[var(--emerald)]"><Plus size={14} /></button>
+                <button type="button" onClick={() => setRuleId('__new__')} title="New rule" className="text-[var(--emerald)]"><Plus size={14} /></button>
               </div>
               {[...rules].sort((a, b) => a.priority - b.priority).map((item) => (
                 <div key={item.id} className={cn('flex items-center gap-1 rounded border bg-[var(--surface)] p-1.5', ruleId === item.id ? 'border-[var(--emerald)]' : 'border-[var(--border)]')}>
@@ -316,7 +316,7 @@ export function StudioView({
             <section className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Templates · {templates.length}</h2>
-                <button type="button" onClick={() => setTemplateId(null)} className="text-[var(--emerald)]"><Plus size={14} /></button>
+                <button type="button" onClick={() => setTemplateId('__new__')} className="text-[var(--emerald)]"><Plus size={14} /></button>
               </div>
               {templates.map((template) => (
                 <div key={template.id} className={cn('flex items-center gap-2 rounded border bg-[var(--surface)] p-2', templateId === template.id ? 'border-[var(--emerald)]' : 'border-[var(--border)]')}>

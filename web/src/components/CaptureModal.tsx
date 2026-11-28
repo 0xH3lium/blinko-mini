@@ -16,7 +16,7 @@ export function CaptureModal({
   open, initialMode, fields, tags, notify, onClose, onCreated,
 }: {
   open: boolean;
-  initialMode: 'auto' | 'manual';
+  initialMode: Mode;
   fields: CustomField[];
   tags: string[];
   notify: Notify;

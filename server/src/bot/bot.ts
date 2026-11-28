@@ -4,7 +4,7 @@ import type { InlineQueryResult } from 'grammy/types';
 import type Database from 'better-sqlite3';
 import { config } from '../config.js';
 import { getDatabase } from '../db/client.js';
-import { listReminders, listRules, getAgenda, getSetting, type Bucket, type Reminder, type Agenda, BUCKETS } from '../db/queries.js';
+import { listReminders, listRules, getAgenda, getSetting, setSetting, type Bucket, type Reminder, type Agenda, BUCKETS } from '../db/queries.js';
 import { ingestCaptureAuto, ingestBatch, reextractEdited } from '../engine/pipeline.js';
 import { compileExtraction } from '../engine/extractor.js';
 import { getTriage } from '../db/queries.js';
@@ -15,12 +15,22 @@ import {
   renderTriageCard, searchKeyboard, splitCallback, triageKeyboard, truncate, undoTrashKeyboard,
 } from './keyboards.js';
 
-// ---- per-chat interactive state (single-owner bot; in-memory is enough) ----
+// ---- per-chat interactive state, persisted so a restart cannot drop a queued /batch ----
 interface ChatState { batch?: string[]; pendingSearch?: boolean; searchQuery?: string; triageIndex?: number }
 const chats = new Map<number, ChatState>();
 function state(chatId: number): ChatState {
   let s = chats.get(chatId);
-  if (!s) { s = {}; chats.set(chatId, s); }
+  if (!s) {
+    let saved: ChatState = {};
+    try { saved = JSON.parse(getSetting(db(), `bot_chat_state:${chatId}`, '{}')) as ChatState; } catch { /* ignore corrupt state */ }
+    const key = `bot_chat_state:${chatId}`;
+    const persist = () => setSetting(db(), key, JSON.stringify(saved));
+    s = new Proxy(saved, {
+      set(target, property, value) { Reflect.set(target, property, value); persist(); return true; },
+      deleteProperty(target, property) { Reflect.deleteProperty(target, property); persist(); return true; },
+    });
+    chats.set(chatId, s);
+  }
   return s;
 }
 
@@ -78,7 +88,8 @@ async function renderReminder(ctx: Context, id: string): Promise<void> {
   const text = r
     ? `⏰ ${truncate(capture?.content ?? '', 200)}\nDue ${fmtTime(r.dueAt)}${r.recurrence ? ` · ↻ ${r.recurrence}` : ''} · snoozed ${r.snoozeCount}× · ${r.state}`
     : `No pending reminder.`;
-  const markup = { reply_markup: reminderKeyboard(id) };
+  const terminal = !r || r.state === 'done' || r.state === 'killed';
+  const markup = { reply_markup: terminal ? undefined : reminderKeyboard(id) };
   if (ctx.callbackQuery?.message) await ctx.editMessageText(text, markup).catch(() => undefined);
   else await ctx.reply(text, markup);
 }
@@ -204,7 +215,7 @@ async function handleReminderOp(ctx: Context, id: string, op: ReminderOp): Promi
   const r = updated?.reminder;
   const label = op === 'kill' ? 'Killed' : op === 'done' ? 'Done' : `Snoozed → ${r ? fmtTime(r.dueAt) : ''}`;
   await answer(ctx, label);
-  await ctx.editMessageReplyMarkup({ reply_markup: reminderKeyboard(id) }).catch(() => undefined);
+  await renderReminder(ctx, id);
 }
 
 async function handleTriage(ctx: Context, rest: string[]): Promise<void> {
@@ -387,7 +398,7 @@ export function createBot(): Bot {
 
     // batch mode: collect notes
     if (s.batch !== undefined) {
-      s.batch.push(text.trim());
+      s.batch = [...s.batch, text.trim()];
       await ctx.reply(`📦 +1 (${s.batch.length} queued). /done to save, /cancel to abort.`).catch(() => undefined);
       return;
     }

@@ -2,7 +2,7 @@ import { InlineKeyboard } from 'grammy';
 import { BUCKETS, type Bucket, type Capture } from '../db/queries.js';
 
 export const BUCKET_EMOJI: Record<Bucket, string> = {
-  idea: '🤯', memory: '🤔', reminder: '🙏', question: '👀', reference: '👌', noise: '😎',
+  idea: '🤯', memory: '🤔', reminder: '🙏', question: '👀', reference: '👌', noise: '🗿',
 };
 
 export const BUCKET_LABELS: Record<Bucket, string> = {

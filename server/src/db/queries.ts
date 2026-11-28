@@ -183,6 +183,7 @@ export interface ParsedSearchQuery {
   age: Array<{ op: '<' | '>'; ms: number }>;
   text: string;
   ftsQuery: string | null;
+  sort?: string;
 }
 
 export interface AgendaItem extends Reminder {
@@ -519,7 +520,8 @@ export function upsertFieldValue(db: Database.Database, captureId: string, field
      ON CONFLICT(capture_id, field_id) DO UPDATE SET value_text = excluded.value_text, value_num = excluded.value_num,
        source = excluded.source, locked = CASE WHEN excluded.locked = 1 THEN 1 ELSE capture_fields.locked END,
        updated_at = excluded.updated_at`,
-  ).run(captureId, fieldId, input.valueText ?? null, input.valueNum ?? null, input.source, input.locked ? 1 : 0, Date.now());
+  ).run(captureId, fieldId, input.valueText ?? (input.valueNum === null || input.valueNum === undefined ? null : String(input.valueNum)),
+    input.valueNum ?? null, input.source, input.locked ? 1 : 0, Date.now());
 }
 
 export function deleteFieldValue(db: Database.Database, captureId: string, fieldId: string): void {
@@ -622,6 +624,7 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
 
   remaining = remaining.replace(FIELD_TOKEN, (_match, neg: string | undefined, rawName: string, op: FieldOperator, rawValue: string) => {
     const name = rawName.toLowerCase();
+    if (name === 'sort') { parsed.sort = rawValue.replace(/^["']|["']$/g, ''); return ' '; }
     if (RESERVED_NAMES.has(name) || rawValue.startsWith('//')) return ' ';
     const value = rawValue.replace(/^["']|["']$/g, '');
     if (name === 'len' && (op === '<' || op === '>') && Number.isFinite(Number(value))) {
@@ -645,10 +648,10 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
   return parsed;
 }
 
-function ownerDayStart(now: number): number {
+function ownerDayStart(now: number, timeZone = config.OWNER_TIMEZONE): number {
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: config.OWNER_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
       hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
     }).formatToParts(new Date(now));
     const value = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
@@ -670,7 +673,7 @@ interface Filters {
   includeTrash: boolean;
 }
 
-function buildFilters(filters: CaptureFilters, parsed: ParsedSearchQuery, now: number): Filters {
+function buildFilters(filters: CaptureFilters, parsed: ParsedSearchQuery, now: number, timeZone: string): Filters {
   const result: Filters = { joins: [], joinParams: [], where: [], whereParams: [], ftsActive: false, includeTrash: filters.includeTrash === true };
   const { where, whereParams, joins, joinParams } = result;
 
@@ -729,7 +732,7 @@ function buildFilters(filters: CaptureFilters, parsed: ParsedSearchQuery, now: n
     }
   }
 
-  const dayStart = ownerDayStart(now);
+  const dayStart = ownerDayStart(now, timeZone);
   for (const due of parsed.due) {
     if (due === 'overdue') {
       where.push("EXISTS (SELECT 1 FROM reminders r WHERE r.capture_id = c.id AND r.state IN ('pending','notified') AND r.due_at < ?)");
@@ -756,7 +759,12 @@ function buildFilters(filters: CaptureFilters, parsed: ParsedSearchQuery, now: n
     const numeric = Number(filter.value);
     const negated = filter.value.startsWith('!');
     const value = negated ? filter.value.slice(1) : filter.value;
-    if (filter.op !== ':' && Number.isFinite(numeric) && !negated) {
+    if (filter.op === ':' && !negated && Number.isFinite(numeric)) {
+      where.push(`EXISTS (SELECT 1 FROM capture_fields cf JOIN custom_fields f ON f.id = cf.field_id
+                   WHERE cf.capture_id = c.id AND (f.name = ? OR f.alias = ?)
+                     AND (LOWER(COALESCE(cf.value_text, '')) = LOWER(?) OR cf.value_num = ?))`);
+      whereParams.push(filter.field, filter.field, value, numeric);
+    } else if (filter.op !== ':' && Number.isFinite(numeric) && !negated) {
       where.push(`EXISTS (SELECT 1 FROM capture_fields cf JOIN custom_fields f ON f.id = cf.field_id
                    WHERE cf.capture_id = c.id AND (f.name = ? OR f.alias = ?) AND cf.value_num ${filter.op} ?)`);
       whereParams.push(filter.field, filter.field, numeric);
@@ -802,12 +810,12 @@ function orderByFor(filters: CaptureFilters, ftsActive: boolean): { sql: string;
 export function listCaptures(db: Database.Database, filters: CaptureFilters = {}): CapturePage {
   const now = Date.now();
   const parsed = parseSearchQuery(filters.q ?? '');
-  const filtered = buildFilters(filters, parsed, now);
+  const filtered = buildFilters(filters, parsed, now, getSetting(db, 'owner_timezone', config.OWNER_TIMEZONE));
   const where = filtered.where.length > 0 ? filtered.where.join(' AND ') : '1 = 1';
   const countRow = db.prepare(`SELECT COUNT(*) AS count FROM captures c ${filtered.joins.join(' ')} WHERE ${where}`)
     .get(...filtered.joinParams, ...filtered.whereParams) as { count: number };
 
-  const order = orderByFor(filters, filtered.ftsActive);
+  const order = orderByFor({ ...filters, sort: filters.sort ?? (parsed.sort as CaptureSort | undefined) }, filtered.ftsActive);
   const limit = Math.min(Math.max(filters.limit ?? 100, 1), 5000);
   const offset = Math.max(filters.offset ?? 0, 0);
   const snippetSelect = filtered.ftsActive
@@ -898,7 +906,7 @@ export function listReminders(db: Database.Database): Reminder[] {
 }
 
 export function getAgenda(db: Database.Database, now = Date.now()): Agenda {
-  const dayStart = ownerDayStart(now);
+  const dayStart = ownerDayStart(now, getSetting(db, 'owner_timezone', config.OWNER_TIMEZONE));
   const rows = db.prepare(
     `SELECT r.*, c.content, c.bucket, c.status, c.is_pinned FROM reminders r
      JOIN captures c ON c.id = r.capture_id WHERE c.deleted_at IS NULL AND r.state IN ('pending','notified') ORDER BY r.due_at ASC`,

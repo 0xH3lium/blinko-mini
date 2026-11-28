@@ -10,7 +10,10 @@ import { config } from '../config.js';
 
 const HASHTAG_PATTERN = /(?:^|\s)#([\p{L}\p{N}_-]{1,50})/gu;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/iu;
-const TZ = () => config.OWNER_TIMEZONE;
+export function ownerTimeZone(db?: Database.Database): string {
+  return db ? getSetting(db, 'owner_timezone', config.OWNER_TIMEZONE) : config.OWNER_TIMEZONE;
+}
+const TZ = () => ownerTimeZone();
 
 export interface InlineField {
   valueText: string | null;
@@ -169,8 +172,8 @@ export function nextDueAt(recurrence: string, from = Date.now(), timeZone = TZ()
   return null;
 }
 
-export function parseDueAt(text: string, now = new Date()): number | null {
-  const offset = timezoneOffset(TZ(), now);
+export function parseDueAt(text: string, now = new Date(), timeZone = TZ()): number | null {
+  const offset = timezoneOffset(timeZone, now);
   const zone = `${offset >= 0 ? '+' : '-'}${String(Math.floor(Math.abs(offset) / 3_600_000)).padStart(2, '0')}:${String(Math.floor((Math.abs(offset) % 3_600_000) / 60_000)).padStart(2, '0')}`;
   const results = chrono.parse(text, { instant: now, timezone: zone }, { forwardDate: true });
   for (const result of results) {
@@ -290,7 +293,7 @@ function parseInlineFields(text: string, fields: CustomField[], enabled: boolean
   return { text: cleaned, fields: result };
 }
 
-function parseRecurrenceToken(text: string): { text: string; recurrence: string | null; dueAt: number | null; expiresAt: number | null } {
+function parseRecurrenceToken(text: string, timeZone: string): { text: string; recurrence: string | null; dueAt: number | null; expiresAt: number | null } {
   let cleaned = text;
   let recurrence: string | null = null;
   let dueAt: number | null = null;
@@ -303,7 +306,7 @@ function parseRecurrenceToken(text: string): { text: string; recurrence: string 
   });
   cleaned = cleaned.replace(/!every\s+(\d+)\s*([mhd])\b/giu, (_match, count: string, unit: string) => {
     recurrence = `every:${count}${unit.toLowerCase()}`;
-    dueAt = nextDueAt(recurrence) ?? null;
+    dueAt = nextDueAt(recurrence, Date.now(), timeZone) ?? null;
     return ' ';
   });
   cleaned = cleaned.replace(/!every\s+(daily|day)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/giu, (_match, _day: string, hourRaw: string, minuteRaw: string | undefined, meridiem: string | undefined) => {
@@ -311,7 +314,7 @@ function parseRecurrenceToken(text: string): { text: string; recurrence: string 
     if (meridiem?.toLowerCase() === 'pm' && hour < 12) hour += 12;
     if (meridiem?.toLowerCase() === 'am' && hour === 12) hour = 0;
     recurrence = `daily@${String(hour).padStart(2, '0')}:${minuteRaw ?? '00'}`;
-    dueAt = nextDueAt(recurrence) ?? null;
+    dueAt = nextDueAt(recurrence, Date.now(), timeZone) ?? null;
     return ' ';
   });
   cleaned = cleaned.replace(/!every\s+([a-z]{3}(?:,[a-z]{3})*)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/giu, (_match, days: string, hourRaw: string, minuteRaw: string | undefined, meridiem: string | undefined) => {
@@ -319,7 +322,7 @@ function parseRecurrenceToken(text: string): { text: string; recurrence: string 
     if (meridiem?.toLowerCase() === 'pm' && hour < 12) hour += 12;
     if (meridiem?.toLowerCase() === 'am' && hour === 12) hour = 0;
     recurrence = `weekly:${days.toLowerCase()}@${String(hour).padStart(2, '0')}:${minuteRaw ?? '00'}`;
-    dueAt = nextDueAt(recurrence) ?? null;
+    dueAt = nextDueAt(recurrence, Date.now(), timeZone) ?? null;
     return ' ';
   });
   return { text: cleaned, recurrence, dueAt, expiresAt };
@@ -342,12 +345,13 @@ export async function runDeterministic(
   const fields = options.fields ?? (options.db ? listFields(options.db, true) : []);
   const inlineEnabled = options.inlineSyntax ?? (options.db ? getSetting(options.db, 'inline_syntax_enabled', 'true') === 'true' : true);
   const inline = parseInlineFields(prefix.text, inlineEnabled ? fields : [], inlineEnabled);
-  const recurrence = parseRecurrenceToken(inline.text);
+  const timeZone = ownerTimeZone(options.db);
+  const recurrence = parseRecurrenceToken(inline.text, timeZone);
   const isPinned = /!pin|📌/iu.test(recurrence.text);
   const cleaned = recurrence.text.replace(/!pin|📌/giu, ' ').replace(/\s+/gu, ' ').trim();
 
   const tags = extractHashtags(cleaned);
-  const parsedDueAt = recurrence.dueAt ?? parseDueAt(cleaned, now);
+  const parsedDueAt = recurrence.dueAt ?? parseDueAt(cleaned, now, timeZone);
   const url = extractUrls(cleaned)[0] ?? null;
   let sourceUrl: string | null = url;
   let urlTitle: string | null = null;

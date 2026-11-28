@@ -58,15 +58,15 @@ export function ConfirmDialog({
         aria-modal="true"
         aria-labelledby="confirm-title"
         aria-describedby="confirm-description"
-        className="w-full max-w-[400px] animate-rise rounded-2xl border border-[var(--app-border)] bg-[var(--app-surface)] p-5 shadow-float"
+        className="w-full max-w-[400px] animate-rise rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-float"
       >
         <div className="flex items-start justify-between gap-4">
           <span
             className={cn(
               'flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl',
               danger
-                ? 'bg-[var(--app-danger-soft)] text-[var(--app-danger)]'
-                : 'bg-[var(--app-accent-soft)] text-[var(--app-accent)]',
+                ? 'bg-[var(--rose-soft)] text-[var(--rose)]'
+                : 'bg-[var(--emerald-soft)] text-[var(--emerald)]',
             )}
           >
             <AlertTriangle size={18} />
@@ -76,7 +76,7 @@ export function ConfirmDialog({
             onClick={onCancel}
             disabled={busy}
             aria-label="Close"
-            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-muted)] transition hover:bg-[var(--app-surface-hover)] hover:text-[var(--app-text)] disabled:opacity-40"
+            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--muted)] transition hover:bg-[var(--surface-hover)] hover:text-[var(--text)] disabled:opacity-40"
           >
             <X size={16} />
           </button>
@@ -84,13 +84,13 @@ export function ConfirmDialog({
 
         <h2
           id="confirm-title"
-          className="mt-4 font-display text-[23px] font-bold leading-tight tracking-[-0.03em] text-[var(--app-text)]"
+          className="mt-4 text-[23px] font-bold leading-tight tracking-[-0.03em] text-[var(--text)]"
         >
           {title}
         </h2>
         <p
           id="confirm-description"
-          className="mt-1.5 text-[13px] leading-relaxed text-[var(--app-hint)]"
+          className="mt-1.5 text-[13px] leading-relaxed text-[var(--hint)]"
         >
           {description}
         </p>
@@ -101,7 +101,7 @@ export function ConfirmDialog({
             type="button"
             onClick={onCancel}
             disabled={busy}
-            className="h-11 flex-1 rounded-xl border border-[var(--app-border-strong)] text-[13px] font-semibold text-[var(--app-text)] transition hover:bg-[var(--app-surface-hover)] disabled:opacity-50"
+            className="h-11 flex-1 rounded-xl border border-[var(--border-strong)] text-[13px] font-semibold text-[var(--text)] transition hover:bg-[var(--surface-hover)] disabled:opacity-50"
           >
             {cancelLabel}
           </button>
@@ -112,8 +112,8 @@ export function ConfirmDialog({
             className={cn(
               'flex h-11 flex-1 items-center justify-center gap-2 rounded-xl text-[13px] font-semibold transition active:scale-[0.98] disabled:opacity-60',
               danger
-                ? 'bg-[var(--app-danger)] text-white hover:bg-[#dc2626]'
-                : 'bg-[var(--app-accent)] text-[var(--app-accent-text)]',
+                ? 'bg-[var(--rose)] text-white hover:bg-[#dc2626]'
+                : 'bg-[var(--emerald)] text-[#05130d]',
             )}
           >
             {busy ? <LoaderCircle size={15} className="animate-spin" /> : null}

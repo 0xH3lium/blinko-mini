@@ -9,15 +9,14 @@ import {
   BUCKETS, CAPTURE_STATUSES, EDGE_RELATIONS, FIELD_TYPES, bucketCounts, createSavedView,
   deleteEdge, deleteField, deleteFieldValue, deleteSavedView, deleteTemplate, deleteRule,
   fieldFromRow, getCapture, getCaptureDetail, getCaptureRow, getField, getReminder, getRule,
-  getSettings, getAgenda, getTemplate, getTriage, insertEdge, listCaptures, listEdgesForCapture,
-  listFields, listReminders, listRules, listSavedViews, listTags, listTemplates, rebuildFts,
-  setCaptureTags, setSetting, syncCaptureFts, templateFromRow, updateSavedView, upsertField,
-  upsertFieldValue, upsertReminder, upsertRule, upsertTemplate, ruleFromRow,
+  getSettings, getAgenda, getTemplate, getTriage, listEdgesForCapture,
+  listFields, listRules, listSavedViews, listTags, listTemplates, rebuildFts,
+  setSetting, templateFromRow, updateSavedView, upsertField,
+  upsertRule, upsertTemplate, ruleFromRow,
   type Bucket, type CaptureFilters, type CaptureSort, type FieldSource,
 } from '../db/queries.js';
 import { getCapturesService, initCapturesService, ServiceError, type ReminderAction } from '../services/captures.service.js';
 import { createCaptureManual, ingestBatch, ingestCaptureAuto, mergeCaptures } from '../engine/pipeline.js';
-import { runDeterministic } from '../engine/deterministic.js';
 import { dryRunText, executeRuleSweep, previewRuleSweep } from '../engine/rules.js';
 import { compileExtraction } from '../engine/extractor.js';
 import { applyPatch, patchSchema, previewPatch } from '../engine/patcher.js';
@@ -25,6 +24,7 @@ import { findRelatedCaptures } from '../engine/similarity.js';
 import { emptyTrash, ttlSweep } from '../engine/scheduler.js';
 import { emit, subscribe } from '../services/events.service.js';
 import { sessionAuth } from '../middleware/sessionAuth.js';
+import { backupSchema, exportBackup, restoreBackup } from '../backup.js';
 
 const db = (): Database.Database => getDatabase();
 const captures = () => initCapturesService(db());
@@ -63,6 +63,7 @@ const createCaptureSchema = z.preprocess(
 const updateCaptureSchema = z.object({
   content: z.string().min(1).optional(), bucket: bucketSchema.optional(), status: statusSchema.optional(),
   isPinned: z.boolean().optional(), captureMode: z.enum(['auto', 'manual']).optional(), triaged: z.boolean().optional(),
+  touch: z.boolean().optional(),
   expiresAt: z.number().int().nullable().optional(), expireAction: z.enum(['archive', 'trash', 'delete']).optional(),
   tags: z.array(z.string()).optional(), sourceUrl: z.union([z.string().url(), z.null()]).optional(),
   urlTitle: z.string().nullable().optional(), urlExcerpt: z.string().nullable().optional(),
@@ -133,7 +134,7 @@ apiRoutes.get('/captures', (c) => {
     q: z.string().optional(), bucket: bucketSchema.optional(),
     status: z.union([statusSchema, z.literal('all')]).default('active'), tag: z.string().optional(),
     sort: z.string().optional(), order: z.enum(['asc', 'desc']).optional(),
-    limit: z.coerce.number().int().min(1).max(500).default(100), offset: z.coerce.number().int().min(0).default(0),
+    limit: z.coerce.number().int().min(1).max(5000).default(100), offset: z.coerce.number().int().min(0).default(0),
   }).safeParse(c.req.query());
   if (!query.success) return fail(c, 'Invalid query parameters');
   const filters: CaptureFilters = {
@@ -363,9 +364,8 @@ apiRoutes.delete('/rules/:id', (c) => {
 apiRoutes.post('/rules/test', async (c) => {
   const parsed = z.object({ text: z.string().min(1), url: z.string().url().optional() }).strict().safeParse(await readBody(c));
   if (!parsed.success) return fail(c, 'text is required');
-  const result = dryRunText(db(), parsed.data);
-  const deterministic = await runDeterministic(parsed.data.text, new Date(), { db: db(), skipUrlFetch: true });
-  return c.json({ ...result, deterministic, final: { bucket: result.patch.bucket ?? deterministic.bucketHint ?? 'idea', tags: result.patch.addTags ?? [], fields: result.patch.fields ?? {}, expiresAt: result.patch.expiresAt ?? null } });
+  const result = await dryRunText(db(), parsed.data);
+  return c.json({ ...result, final: { bucket: result.patch.bucket ?? result.deterministic.bucketHint ?? 'idea', tags: result.patch.addTags ?? [], fields: result.patch.fields ?? {}, expiresAt: result.patch.expiresAt ?? null } });
 });
 
 apiRoutes.post('/rules/sweep/preview', async (c) => {
@@ -470,54 +470,9 @@ apiRoutes.post('/system/maintenance', async (c) => {
 });
 
 apiRoutes.post('/import/json', async (c) => {
-  const parsed = z.object({
-    captures: z.array(z.object({
-      id: z.string(), content: z.string(), bucket: bucketSchema.default('idea'), status: statusSchema.default('active'),
-      isPinned: z.boolean().optional(), captureMode: z.enum(['auto', 'manual']).optional(), triaged: z.boolean().optional(),
-      sourceUrl: z.string().nullable().optional(), urlTitle: z.string().nullable().optional(),
-      urlExcerpt: z.string().nullable().optional(), meta: z.record(z.unknown()).optional(),
-      expiresAt: z.number().nullable().optional(), expireAction: z.enum(['archive', 'trash', 'delete']).optional(),
-      deletedAt: z.number().nullable().optional(), createdAt: z.number(), updatedAt: z.number().optional(),
-      tags: z.array(z.string()).optional(),
-      fields: z.record(z.object({ valueText: z.string().nullable().optional(), valueNum: z.number().nullable().optional() })).optional(),
-      reminder: z.object({ dueAt: z.number(), state: z.enum(['pending', 'notified', 'done', 'killed']).optional(), snoozeCount: z.number().optional(), recurrence: z.string().nullable().optional() }).optional(),
-    })).default([]),
-    edges: z.array(z.object({ sourceId: z.string(), targetId: z.string(), relation: relationSchema, note: z.string().nullable().optional() })).default([]),
-    settings: z.record(z.string()).optional(),
-  }).strict().safeParse(await readBody(c));
+  const parsed = backupSchema.safeParse(await readBody(c));
   if (!parsed.success) return fail(c, `Invalid backup: ${parsed.error.issues[0]?.message ?? 'bad request'}`);
-  const database = db();
-  let imported = 0;
-  database.transaction(() => {
-    for (const item of parsed.data.captures) {
-      database.prepare(
-        `INSERT INTO captures (id, content, bucket, status, is_pinned, capture_mode, triaged, source_url, url_title,
-           url_excerpt, meta, expires_at, expire_action, deleted_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET content = excluded.content, bucket = excluded.bucket, status = excluded.status,
-           is_pinned = excluded.is_pinned, capture_mode = excluded.capture_mode, triaged = excluded.triaged,
-           source_url = excluded.source_url, url_title = excluded.url_title, url_excerpt = excluded.url_excerpt,
-           meta = excluded.meta, expires_at = excluded.expires_at, expire_action = excluded.expire_action,
-           deleted_at = excluded.deleted_at, created_at = excluded.created_at, updated_at = excluded.updated_at`,
-      ).run(item.id, item.content, item.bucket, item.status, item.isPinned ? 1 : 0, item.captureMode ?? 'auto',
-        item.triaged ? 1 : 0, item.sourceUrl ?? null, item.urlTitle ?? null, item.urlExcerpt ?? null,
-        JSON.stringify(item.meta ?? {}), item.expiresAt ?? null, item.expireAction ?? 'archive', item.deletedAt ?? null,
-        item.createdAt, item.updatedAt ?? item.createdAt);
-      setCaptureTags(db(), item.id, item.tags ?? []);
-      for (const [name, value] of Object.entries(item.fields ?? {})) {
-        const field = getField(db(), name);
-        if (field) upsertFieldValue(db(), item.id, field.id, { ...value, source: 'patch' });
-      }
-      if (item.reminder) upsertReminder(db(), item.id, {
-        dueAt: item.reminder.dueAt, state: item.reminder.state ?? 'pending',
-        snoozeCount: item.reminder.snoozeCount ?? 0, recurrence: item.reminder.recurrence ?? null,
-      });
-      syncCaptureFts(db(), item.id);
-      imported += 1;
-    }
-    for (const edge of parsed.data.edges) insertEdge(db(), edge.sourceId, edge.targetId, edge.relation, edge.note ?? null);
-    for (const [key, value] of Object.entries(parsed.data.settings ?? {})) setSetting(db(), key, value);
-  })();
+  const imported = restoreBackup(db(), parsed.data);
   emit('capture.bulk', { imported });
   return c.json({ imported });
 });
@@ -570,27 +525,13 @@ apiRoutes.get('/telemetry', (c) => {
 apiRoutes.get('/export', (c) => {
   const format = z.enum(['json', 'md']).safeParse(c.req.query('format') ?? 'json');
   if (!format.success) return fail(c, 'format must be json or md');
-  const includeTrash = c.req.query('includeTrash') === 'true';
-  const page = listCaptures(db(), { status: 'all', includeTrash, limit: 5000 });
-  const ids = new Set(page.captures.map((capture) => capture.id));
-  const payload = {
-    exportedAt: new Date().toISOString(),
-    captures: page.captures,
-    tags: db().prepare('SELECT name FROM tags ORDER BY name').all(),
-    fields: db().prepare('SELECT * FROM custom_fields ORDER BY sort_order').all(),
-    rules: db().prepare('SELECT * FROM rules ORDER BY priority').all(),
-    extractors: db().prepare('SELECT * FROM extractor_templates ORDER BY sort_order').all(),
-    captureFields: ids.size ? db().prepare(`SELECT * FROM capture_fields WHERE capture_id IN (${[...ids].map(() => '?').join(', ')})`).all(...ids) : [],
-    reminders: db().prepare('SELECT * FROM reminders').all(),
-    edges: db().prepare('SELECT * FROM capture_edges').all(),
-    settings: getSettings(db()),
-  };
+  const backup = exportBackup(db(), c.req.query('includeTrash') === 'true');
   if (format.data === 'json') {
-    return c.body(JSON.stringify(payload), 200, {
+    return c.body(JSON.stringify(backup), 200, {
       'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="blinko-backup.json"',
     });
   }
-  const lines = page.captures.map((capture) => `## [${capture.bucket}] ${new Date(capture.createdAt).toISOString()}\n\n${capture.content}`);
+  const lines = backup.captures.map((capture) => `## [${capture.bucket}] ${new Date(capture.createdAt).toISOString()}\n\n${capture.content}`);
   return c.body(`# BLINKO//OS export\n\n${lines.join('\n\n')}\n`, 200, {
     'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': 'attachment; filename="blinko-backup.md"',
   });

@@ -30,6 +30,7 @@ export interface UpdateCaptureInput {
   isPinned?: boolean;
   captureMode?: 'auto' | 'manual';
   triaged?: boolean;
+  touch?: boolean;
   expiresAt?: number | null;
   expireAction?: 'archive' | 'trash' | 'delete';
   deletedAt?: number | null;
@@ -95,8 +96,8 @@ export class CapturesService {
       if (patch.urlExcerpt !== undefined) set('url_excerpt', patch.urlExcerpt);
       if (patch.meta !== undefined) set('meta', JSON.stringify(patch.meta));
       if (patch.createdAt !== undefined) set('created_at', patch.createdAt);
-      if (sets.length) {
-        set('updated_at', Date.now());
+      if (patch.touch || sets.length) {
+        if (!sets.includes('updated_at')) set('updated_at', Date.now());
         this.db.prepare(`UPDATE captures SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
       }
       if (patch.tags !== undefined) {
@@ -191,9 +192,13 @@ export class CapturesService {
   }
 
   restore(id: string): boolean {
-    const result = this.db.prepare('UPDATE captures SET deleted_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL').run(Date.now(), id);
-    if (result.changes > 0) emit('capture.restored', { id });
-    return result.changes > 0;
+    const restored = this.db.transaction(() => {
+      const result = this.db.prepare('UPDATE captures SET deleted_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL').run(Date.now(), id);
+      if (result.changes > 0) syncCaptureFts(this.db, id);
+      return result.changes > 0;
+    })();
+    if (restored) emit('capture.restored', { id });
+    return restored;
   }
 
   addEdge(sourceId: string, targetId: string, relation: EdgeRelation, note?: string | null): void {
@@ -231,6 +236,7 @@ export class CapturesService {
         impacted = existing.filter((id) => this.db.prepare('UPDATE captures SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(Date.now(), Date.now(), id).changes > 0);
       } else if (action.type === 'restore') {
         impacted = existing.filter((id) => this.db.prepare('UPDATE captures SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL').run(id).changes > 0);
+        for (const id of impacted) syncCaptureFts(this.db, id);
       } else if (action.type === 'setField') {
         const field = getField(this.db, action.name);
         if (!field) throw new ServiceError(`Unknown field: ${action.name}`, 404);

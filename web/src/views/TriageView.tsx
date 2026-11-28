@@ -43,8 +43,9 @@ export function TriageView({
       else if (event.key === 'a') {
         const value = current.fields.actionable?.valueText === 'yes' ? 'no' : 'yes';
         void onPatch(current.id, { fields: { actionable: { valueText: value, valueNum: value === 'yes' ? 1 : 0, source: 'human' } } });
-      } else if (/^[0-3]$/.test(event.key)) {
-        void onPatch(current.id, { fields: { leverage: { valueNum: Number(event.key), valueText: event.key, source: 'human' } } });
+      } else if (event.key === 'l') {
+        const next = ((current.fields.leverage?.valueNum ?? 0) + 1) % 4;
+        void onPatch(current.id, { fields: { leverage: { valueNum: next, valueText: String(next), source: 'human' } } });
       } else if (event.key === ' ') { event.preventDefault(); void onPatch(current.id, { triaged: true }); }
       else if (event.key === 'r') onResolve(current.id);
       else if (event.key === 'x') onTrash(current.id);
@@ -136,7 +137,7 @@ export function TriageView({
                   <span>touched {relativeTime(capture.updatedAt)}</span>
                   <button type="button" onClick={() => onResolve(capture.id)} className="flex items-center gap-1 rounded border border-[var(--emerald)] px-1.5 py-0.5 text-[var(--emerald)]"><Check size={9} /> Resolve</button>
                   <button type="button" onClick={() => void onPatch(capture.id, { status: 'archived' })} className="rounded border border-[var(--border)] px-1.5 py-0.5 text-[var(--hint)]">Archive</button>
-                  <button type="button" onClick={() => void onPatch(capture.id, {})} className="rounded border border-[var(--border)] px-1.5 py-0.5 text-[var(--hint)]">Keep Active (bump)</button>
+                  <button type="button" onClick={() => void onPatch(capture.id, { touch: true })} className="rounded border border-[var(--border)] px-1.5 py-0.5 text-[var(--hint)]">Keep Active (bump)</button>
                 </div>
               </section>
             ))}

@@ -192,6 +192,7 @@ export interface CapturePatch {
   status?: CaptureStatus;
   isPinned?: boolean;
   triaged?: boolean;
+  touch?: boolean;
   captureMode?: 'auto' | 'manual';
   expiresAt?: number | null;
   expireAction?: 'archive' | 'trash' | 'delete';

@@ -5,6 +5,7 @@ import {
   normalizeTags, setCaptureTags, syncCaptureFts, upsertFieldValue, upsertReminder,
   type Bucket, type Capture, type CaptureStatus, type Rule,
 } from '../db/queries.js';
+import { runDeterministic } from './deterministic.js';
 
 export const ruleConditionsSchema = z.object({
   matchMode: z.enum(['all', 'any']).default('all'),
@@ -297,18 +298,17 @@ export function executeRuleSweep(db: Database.Database, ruleIdOrAll: string | un
   return { affected };
 }
 
-export function dryRunText(db: Database.Database, input: { text: string; url?: string }): {
-  deterministic: { text: string; bucketHint: Bucket | null; tags: string[] };
+export async function dryRunText(db: Database.Database, input: { text: string; url?: string }): Promise<{
+  deterministic: Awaited<ReturnType<typeof runDeterministic>>;
   matchedRules: RuleMatch[]; patch: RulePatch;
-} {
-  const explicit = /^(?:(?:i|idea|m|mem|q|r|ref|n|noise):|!rem\s|remind\s)/iu.test(input.text.trim());
+}> {
+  const parsed = await runDeterministic(input.text, new Date(), { db, skipUrlFetch: true });
   const { matchedRules, patch } = evaluateRules(listRulesForDryRun(db), {
-    content: input.text, tags: [], bucket: 'idea', explicitBucket: explicit, sourceUrl: input.url ?? null,
+    content: parsed.text, tags: parsed.tags, bucket: parsed.bucketHint ?? 'idea',
+    explicitBucket: Boolean(parsed.bucketHint), sourceUrl: parsed.sourceUrl ?? input.url ?? null,
+    hasDue: Boolean(parsed.parsedDueAt),
   });
-  return {
-    deterministic: { text: input.text, bucketHint: null, tags: [] },
-    matchedRules, patch,
-  };
+  return { deterministic: parsed, matchedRules, patch };
 }
 
 function listRulesForDryRun(db: Database.Database): Rule[] {
